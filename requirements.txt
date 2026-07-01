@@ -34,6 +34,11 @@ cachetools>=5.0.0
 deprecation>=2.1.0
 retry2>=0.9.0
 
+# ─── macOS 原生后端（窗口截图 + 合成鼠标输入） ──────────
+pyobjc-framework-Cocoa>=10.0 ; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0 ; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0 ; sys_platform == "darwin"
+
 # ─── 打包（开发环境） ──────────────────────────────────
 # pyinstaller>=6.0
 # pyinstaller-hooks-contrib>=2024.0

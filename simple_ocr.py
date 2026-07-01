@@ -116,8 +116,10 @@ class SimpleOCR:
         for char, template in templates.items():
             if template.shape[0] > processed_crop.shape[0] or template.shape[1] > processed_crop.shape[1]:
                 continue
+            # 斜杠为细长结构、跨平台缩放下匹配分偏低，单独放宽阈值（不会与数字混淆）
+            char_threshold = max(0.5, threshold - 0.1) if char == 'slash' else threshold
             res = cv2.matchTemplate(processed_crop, template, cv2.TM_CCOEFF_NORMED)
-            loc = np.where(res >= threshold)
+            loc = np.where(res >= char_threshold)
             t_w = template.shape[1]
             for pt in zip(*loc[::-1]):
                 score = float(res[pt[1], pt[0]])

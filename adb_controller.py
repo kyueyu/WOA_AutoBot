@@ -22,6 +22,7 @@ from woa_debug import (
     _woa_debug_save_click_before, woa_debug_save_roi,
 )
 from nemu_ipc import NemuIpcHelper, _load_dll_safe, NEMU_IPC_DEBUG
+from vision import VisionMixin
 
 # 资助功能完整性守卫标记（从 core 导入）
 from core import FEATURE_GUARD_TOKEN as WOA_FEATURE_GUARD_TOKEN
@@ -224,7 +225,7 @@ def set_custom_adb_path(path):
             print(f">>> [系统] ADB 路径重置为默认")
 
 
-class AdbController:
+class AdbController(VisionMixin):
     """支持多种触控方案: adb, uiautomator2"""
     VALID_CONTROL_METHODS = ("adb", "uiautomator2")
     LOGICAL_WIDTH = 1600
@@ -1808,70 +1809,4 @@ class AdbController:
             ])
 
     # 图像识别相关方法保持不变，因为它们不涉及 ADB 通信
-    def _read_image_safe(self, path):
-        return read_image_safe(path)
-
-    _template_cache = {}
-    _template_cache_max = 60  # 上限防止多开时内存无限制增长
-
-    def _cache_template(self, template_path, template):
-        """将模板放入缓存，当缓存超限时清理最旧的条目"""
-        if len(self._template_cache) >= self._template_cache_max:
-            # 删除最早插入的条目（字典保持插入顺序 Python 3.7+）
-            oldest_key = next(iter(self._template_cache))
-            del self._template_cache[oldest_key]
-        self._template_cache[template_path] = template
-
-    def locate_image(self, template_path, confidence=0.8, screen_image=None):
-        import cv2
-        if screen_image is not None:
-            screen = screen_image
-        else:
-            screen = self.get_screenshot()
-        if screen is None: return None
-        template = self._template_cache.get(template_path)
-        if template is None:
-            template = self._read_image_safe(template_path)
-            if template is None: return None
-            self._cache_template(template_path, template)
-        result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-        if max_val >= confidence:
-            h, w = template.shape[:2]
-            return (max_loc[0] + w // 2, max_loc[1] + h // 2, (max_loc[0], max_loc[1], w, h))
-        return None
-
-    def locate_all_images(self, template_path, confidence=0.8, screen_image=None):
-        import cv2
-        import numpy as np
-        if screen_image is not None:
-            screen = screen_image
-        else:
-            screen = self.get_screenshot()
-        if screen is None: return []
-        template = self._template_cache.get(template_path)
-        if template is None:
-            template = self._read_image_safe(template_path)
-            if template is None: return []
-            self._cache_template(template_path, template)
-        result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
-        h, w = template.shape[:2]
-        loc = np.where(result >= confidence)
-        found_items = []
-        for pt in zip(*loc[::-1]):
-            score = result[pt[1], pt[0]]
-            is_duplicate = False
-            for item in found_items:
-                if abs(pt[0] - item['box'][0]) < 10 and abs(pt[1] - item['box'][1]) < 10:
-                    if score > item['score']:
-                        item['score'] = score
-                        item['box'] = (pt[0], pt[1], w, h)
-                        item['top'] = pt[1]
-                        item['center'] = (pt[0] + w // 2, pt[1] + h // 2)
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                found_items.append(
-                    {'box': (pt[0], pt[1], w, h), 'top': pt[1], 'center': (pt[0] + w // 2, pt[1] + h // 2),
-                     'score': score})
-        return found_items
+    # 模板匹配方法（locate_image / locate_all_images / 模板缓存）已上移至 VisionMixin

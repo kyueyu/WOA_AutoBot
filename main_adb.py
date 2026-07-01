@@ -33,6 +33,7 @@ class WoaBot:
         self.config_callback = config_callback
         self.adb = None
         self.target_device = None
+        self.backend = "adb"  # "adb" | "mac_native"
         self.running = False
         self._worker_thread = None
         self.log_callback = log_callback
@@ -225,41 +226,9 @@ class WoaBot:
         self.last_periodic_check_time = 0.0
         self._run_start_time = None  # _do_main_loop 中实际赋值
 
-        self.ICON_ROIS = {
-            'cross_runway.png': self.REGION_BOTTOM_ROI,
-            'get_award_1.png': self.REGION_BOTTOM_ROI,
-            'get_award_2.png': self.REGION_REWARD_RECOVERY,
-            'get_award_3.png': self.REGION_REWARD_RECOVERY,
-            'get_award_4.png': self.REGION_REWARD_RECOVERY,
-            'landing_permitted.png': self.REGION_BOTTOM_ROI,
-            'landing_prohibited.png': self.REGION_BOTTOM_ROI,
-            'push_back.png': self.REGION_BOTTOM_ROI,
-            'stand_confirm.png': self.REGION_BOTTOM_ROI,
-            'start_ground_support.png': self.REGION_BOTTOM_ROI,
-            'start_ice.png': self.REGION_BOTTOM_ROI,
-            'takeoff.png': self.REGION_BOTTOM_ROI,
-            'takeoff_by_gliding.png': self.REGION_BOTTOM_ROI,
-            'taxi_to_runway.png': self.REGION_BOTTOM_ROI,
-            'start_general.png': self.REGION_BOTTOM_ROI,
-            'wait.png': self.REGION_BOTTOM_ROI,
-            'go_repair.png': self.REGION_BOTTOM_ROI,
-            'start_repair.png': self.REGION_BOTTOM_ROI,
-            'ground_support_done.png': self.REGION_BOTTOM_ROI,
-            'stand_vacant_off.png': self.REGION_VACANT_ROI,
-            'stand_vacant_on.png': self.REGION_VACANT_ROI,
-            'green_dot.png': self.REGION_GREEN_DOT
-        }
+        self._build_icon_rois()
 
-        self.task_templates = {}
-        task_files = [
-            'pending_ice.png', 'pending_repair.png', 'pending_doing.png',
-            'pending_approach.png', 'pending_taxiing.png', 'pending_takeoff.png',
-            'pending_stand.png'
-        ]
-        for tf in task_files:
-            p = self.icon_path + tf
-            if os.path.exists(p):
-                self.task_templates[tf] = read_image_safe(p)
+        self._load_task_templates()
 
     def set_random_task_mode(self, enabled, log_change=True):
         if self.enable_random_task == enabled:
@@ -1320,6 +1289,73 @@ class WoaBot:
     def set_device(self, device_serial):
         self.target_device = device_serial
 
+    def _load_task_templates(self):
+        self.task_templates = {}
+        task_files = [
+            'pending_ice.png', 'pending_repair.png', 'pending_doing.png',
+            'pending_approach.png', 'pending_taxiing.png', 'pending_takeoff.png',
+            'pending_stand.png'
+        ]
+        for tf in task_files:
+            p = self.icon_path + tf
+            if os.path.exists(p):
+                self.task_templates[tf] = read_image_safe(p)
+
+    def set_backend(self, backend):
+        if backend not in ("adb", "mac_native"):
+            return
+        self.backend = backend
+        if backend == "mac_native":
+            self._apply_mac_layout()
+        self.log(f">>> [后端] 已切换为: {backend}")
+
+    def _build_icon_rois(self):
+        self.ICON_ROIS = {
+            'cross_runway.png': self.REGION_BOTTOM_ROI,
+            'get_award_1.png': self.REGION_BOTTOM_ROI,
+            'get_award_2.png': self.REGION_REWARD_RECOVERY,
+            'get_award_3.png': self.REGION_REWARD_RECOVERY,
+            'get_award_4.png': self.REGION_REWARD_RECOVERY,
+            'landing_permitted.png': self.REGION_BOTTOM_ROI,
+            'landing_prohibited.png': self.REGION_BOTTOM_ROI,
+            'push_back.png': self.REGION_BOTTOM_ROI,
+            'stand_confirm.png': self.REGION_BOTTOM_ROI,
+            'start_ground_support.png': self.REGION_BOTTOM_ROI,
+            'start_ice.png': self.REGION_BOTTOM_ROI,
+            'takeoff.png': self.REGION_BOTTOM_ROI,
+            'takeoff_by_gliding.png': self.REGION_BOTTOM_ROI,
+            'taxi_to_runway.png': self.REGION_BOTTOM_ROI,
+            'start_general.png': self.REGION_BOTTOM_ROI,
+            'wait.png': self.REGION_BOTTOM_ROI,
+            'go_repair.png': self.REGION_BOTTOM_ROI,
+            'start_repair.png': self.REGION_BOTTOM_ROI,
+            'ground_support_done.png': self.REGION_BOTTOM_ROI,
+            'stand_vacant_off.png': self.REGION_VACANT_ROI,
+            'stand_vacant_on.png': self.REGION_VACANT_ROI,
+            'green_dot.png': self.REGION_GREEN_DOT,
+        }
+
+    def _apply_mac_layout(self):
+        # Mac 原生为 4:3 (1600×~1203)，复用现有 icon/ 模板（等比缩放后匹配）。
+        # 左侧详情面板比 16:9 下移约 +430px，对应 ROI 改用覆盖实际位置的宽松区域。
+        self.LIST_ROI_H = 1300                          # 任务列表贯穿全高
+        self.REGION_STATUS_TITLE = (0, 400, 240, 800)   # 左panel状态标题(航班状态/到达)
+        self.REGION_VACANT_ROI = (420, 980, 860, 240)   # 底部机位选择条
+        self.REGION_BOTTOM_ROI = (20, 1050, 360, 140)   # 左panel底部金色动作按钮(直接起飞/后推...)
+        self.REGION_REWARD_RECOVERY = (300, 520, 1000, 450)  # 居中奖励弹窗(4:3下移)
+        self._build_icon_rois()                         # 用 Mac 区域重建 ICON_ROIS(否则仍是__init__的旧值)
+
+    def _create_controller(self):
+        if self.backend == "mac_native":
+            from mac_native_controller import MacNativeController
+            return MacNativeController(instance_id=self.instance_id)
+        return AdbController(
+            target_device=self.target_device,
+            control_method=self.control_method,
+            screenshot_method=self.screenshot_method,
+            instance_id=self.instance_id,
+        )
+
     def set_control_method(self, method):
         m = (method or "adb").lower()
         valid = ("adb", "uiautomator2")
@@ -1562,12 +1598,7 @@ class WoaBot:
         self.running = True
         self.log(f">>> 连接设备: {self.target_device} ...")
         try:
-            self.adb = AdbController(
-                target_device=self.target_device,
-                control_method=self.control_method,
-                screenshot_method=self.screenshot_method,
-                instance_id=self.instance_id,
-            )
+            self.adb = self._create_controller()
             self.adb.set_mumu_path(self.mumu_path)
             method_probe = self.adb.ensure_methods_usable()
             if self.config_callback:
@@ -1594,7 +1625,7 @@ class WoaBot:
                 self.log(f"✅ 画面正常，脚本启动 (设备分辨率: {raw_w}x{raw_h} -> 逻辑分辨率: {w}x{h})")
             else:
                 self.log(f"✅ 画面正常，脚本启动 (逻辑分辨率: {w}x{h})")
-            ctrl_map = {"adb": "ADB", "uiautomator2": "uiautomator2"}
+            ctrl_map = {"adb": "ADB", "uiautomator2": "uiautomator2", "mac_native": "Mac原生"}
             ctrl = ctrl_map.get(self.adb.control_method, "ADB")
             shot = self.adb.screenshot_method if self.adb.screenshot_method != "adb" else "ADB"
             self.log(f">>> [模式] 触控: {ctrl}, 截图: {shot}")
@@ -2633,10 +2664,34 @@ class WoaBot:
         still_confirm = self._locate_on_screen('buy_vehicle_confirm.png', verify_screen, confidence=0.78)
         return not (still_buy or still_confirm)
 
+    def _mac_ground_service_hits(self, screen):
+        # Mac：底部「地面保障」面板中金色高亮的服务图标=就绪可派遣，按颜色检测其圆形图标。
+        # 面板左固定右生长，服务>6 时向右延伸；x 上限取 1300（避开 x≳1320 的任务列表）。
+        x0, y0, x1, y1 = 380, 1000, 1300, 1160
+        band = screen[y0:y1, x0:x1]
+        hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (18, 110, 140), (40, 255, 255))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        hits = []
+        for ct in contours:
+            x, y, w, h = cv2.boundingRect(ct)
+            if w >= 30 and h >= 30 and 0.55 < w / h < 1.8:
+                hits.append((x0 + x + w // 2, y0 + y + h // 2))
+        return hits
+
     def handle_vehicle_check_task(self, target_pos=None):
         self.sleep(0.2)
         self.log(">>> [任务] 检查 Doing 状态...")
         screen = self.adb.get_screenshot()
+        if self.backend == "mac_native" and screen is not None:
+            gold = self._mac_ground_service_hits(screen)
+            if gold:
+                self._no_operable_count = 0
+                self.log(f"   -> [地面保障] 派遣 {len(gold)} 个就绪服务")
+                for gx, gy in gold:
+                    self.adb.click(gx, gy, random_offset=2)
+                    self.sleep(0.3)
+                return True
         batch_hits = self._batch_locate_on_screen(screen, [
             ('red_warning', 'red_warning.png', 0.75, None),
             ('ground_done', 'ground_support_done.png', 0.8, self.REGION_BOTTOM_ROI),
@@ -2741,8 +2796,13 @@ class WoaBot:
                 has_on  = self.adb.locate_image(self.icon_path + 'stand_vacant_on.png',
                                                 confidence=0.7, screen_image=screen)
                 if has_off or has_on:
-                    self.log("   -> 分配机位 @ (490,770)")
-                    _rclick(490, 770)
+                    if self.backend == "mac_native":
+                        hit = has_off or has_on
+                        ax, ay = hit[0], hit[1]
+                    else:
+                        ax, ay = 490, 770
+                    self.log(f"   -> 分配机位 @ ({ax},{ay})")
+                    _rclick(ax, ay)
                     _rwait(0.25)
                     vfy = self.adb.get_screenshot()
                     if vfy is not None and self.adb.locate_image(
@@ -3083,7 +3143,40 @@ class WoaBot:
         self.next_bonus_retry_time = time.time() + (15 * 60)
         return False
 
+    def _stand_action_mac(self):
+        # Mac 4:3：地勤滑块在 y~878（16:9 版为 y574）。跳过基于固定像素的颜色/图标校验
+        # （位置在 4:3 下不可靠），仅靠 insufficient_ground_staff + 指派按钮判定成功。
+        if self.slide_min_duration >= self.slide_max_duration:
+            dur = self.slide_min_duration
+        else:
+            dur = random.randint(self.slide_min_duration, self.slide_max_duration)
+        sx = int(random.gauss(470, 5))
+        ex = random.randint(770, 800)
+        sy = ey = int(random.gauss(878, 4))
+        self.log(f"   -> [动作] 拟人滑块: ({sx},{sy})->({ex},{ey}) 耗时:{dur}ms")
+        self.adb.swipe(sx, sy, ex, ey, duration_ms=dur)
+        self.sleep(0.3)
+        if self.safe_locate('insufficient_ground_staff.png', confidence=0.7):
+            self.log("🛑 警告：人员不足")
+            self.in_staff_shortage_mode = True
+            self.last_known_available_staff = 0
+            self.close_window()
+            return False
+        if self.wait_and_click('start_ground_support.png', timeout=2.0, click_wait=0):
+            self._stat_stand_count += 1
+            self._stat_session_stand_count += 1
+            cost = self._stat_last_required_cost
+            if cost is not None:
+                self._stat_stand_staff += cost + 1
+                self._stat_session_stand_staff += cost + 1
+            self.sleep(0.5)
+            return True
+        self.close_window()
+        return False
+
     def _perform_stand_action_sequence(self, force_verify=False):
+        if self.backend == "mac_native":
+            return self._stand_action_mac()
         if self.slide_min_duration >= self.slide_max_duration:
             rand_duration = self.slide_min_duration
         else:

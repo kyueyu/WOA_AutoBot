@@ -66,3 +66,6 @@ manifest_*.json
 patch_*.zip
 运行调试版(pyinstaller).bat
 运行调试版(点击后约10s没有任何窗口，是正常现象，nuitka).bat
+CLAUDE.local.md
+mac_debug_capture.png
+mac_calibration.json

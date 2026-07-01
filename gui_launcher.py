@@ -570,6 +570,8 @@ class BackgroundWorker:
 
 
 class Application(ttkb.Window):
+    backend = "mac_native" if sys.platform == "darwin" else "adb"
+
     def __init__(self):
         # Windows 任务栏图标 ID（跨平台安全）
         if IS_WINDOWS:
@@ -870,10 +872,10 @@ class Application(ttkb.Window):
             print(f">>> [金币提醒] {title.split(maxsplit=1)[-1] if ' ' in title else title} 已推送")
 
         def _emit_notice():
-            m1 = "此脚本为开源免费项目，如您是从任何渠道，例如淘宝、闲鱼、拼多多购买的，请立即退款并举报！"
-            m2 = "获取更新和反馈问题请加入QQ群1067076460。"
-            print(m1)
-            print(m2)
+            # m1 = "此脚本为开源免费项目，如您是从任何渠道，例如淘宝、闲鱼、拼多多购买的，请立即退款并举报！"
+            # m2 = "获取更新和反馈问题请加入QQ群1067076460。"
+            # print(m1)
+            # print(m2)
             orig = getattr(sys, "__stdout__", None)
             if orig and getattr(sys, "stdout", None) is not orig:
                 try:
@@ -2149,7 +2151,10 @@ class Application(ttkb.Window):
             btn.configure(state="disabled")
         self.update_idletasks()
         try:
-            devs = self._scan_devices_with_public_targets(debug=False)
+            if self.backend == "mac_native":
+                devs = self._list_woa_window_labels()
+            else:
+                devs = self._scan_devices_with_public_targets(debug=False)
         except Exception as e:
             print(f">>> [扫描异常] {e}")
             devs = []
@@ -3840,6 +3845,23 @@ class Application(ttkb.Window):
         ttkb.Separator(body, bootstyle="primary").pack(fill=X, pady=12)
         win.after(50, lambda: self._center_toplevel_on_parent(win))
 
+    def _list_woa_window_labels(self):
+        import mac_window
+        return [f"{w['owner']} (id={w['id']})"
+                for w in mac_window.list_windows(name_filter=True) if w["layer"] == 0]
+
+    def _ensure_mac_permissions(self):
+        import mac_window
+        if not mac_window.has_screen_recording_permission():
+            mac_window.request_screen_recording_permission()
+            messagebox.showwarning("需要权限", "请在『系统设置 → 隐私与安全性 → 屏幕录制』中授权后重启本程序。")
+            return False
+        if not mac_window.has_accessibility_permission():
+            mac_window.request_accessibility_permission()
+            messagebox.showwarning("需要权限", "请在『系统设置 → 隐私与安全性 → 辅助功能』中授权后重试。")
+            return False
+        return True
+
     def refresh_devices(self):
         if not self._enforce_online_guard("扫描设备", interactive=True):
             return
@@ -3858,7 +3880,9 @@ class Application(ttkb.Window):
         _public_targets_raw = str(self.var_public_adb_targets.get() or "")
 
         def _scan(public_targets_raw):
-            """在后台线程执行 ADB 扫描，不阻塞 GUI。"""
+            """在后台线程执行扫描，不阻塞 GUI。"""
+            if self.backend == "mac_native":
+                return self._list_woa_window_labels()
             public_targets = self._parse_public_adb_targets(raw_text=public_targets_raw)
             if public_targets:
                 connected, failed = self._connect_public_adb_targets(public_targets, debug=True)
@@ -3924,14 +3948,20 @@ class Application(ttkb.Window):
         self.save_config()
 
         try:
-            self._connect_public_adb_targets(debug=False)
-            self._try_use_mumu_adb_for_device(device)
+            if self.backend == "mac_native":
+                if not self._ensure_mac_permissions():
+                    self._recover_from_start_failure("缺少屏幕录制/辅助功能权限")
+                    return
+            else:
+                self._connect_public_adb_targets(debug=False)
+                self._try_use_mumu_adb_for_device(device)
 
             from main_adb import WoaBot
             self.bot = WoaBot(log_callback=self.log_to_queue,
                               config_callback=self.on_bot_config_update,
                               instance_id=INSTANCE_ID)
             self.bot.set_device(device)
+            self.bot.set_backend(self.backend)
             self.sync_all_configs_to_bot()
 
             # 仅当 bot 对象创建且配置同步成功后，才切换按钮状态

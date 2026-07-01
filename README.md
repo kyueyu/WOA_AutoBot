@@ -36,6 +36,7 @@ WOA AutoBot 是一款面向 World of Airports 的自动化辅助工具，目标�
 - 支持按实例隔离配置，多个窗口互不覆盖配置文件
 - 支持在线公告与使用说明弹窗
 - 支持筛选按钮模板匹配+像素回退双重检测，亮/暗颜色语义自动矫正
+- 🍎 **macOS 原生后端（实验性）**：无需安卓模拟器与 ADB，直接通过**屏幕捕获 + 合成鼠标**操控 **Mac 原生版《World of Airports》**（App Store「Designed for iPad」应用），复用现有 OpenCV 识别引擎与 GUI。设计与实现详见 [docs/MAC_NATIVE_BACKEND.md](docs/MAC_NATIVE_BACKEND.md)
 
 ## 平台支持
 
@@ -51,6 +52,15 @@ WOA AutoBot 是一款面向 World of Airports 的自动化辅助工具，目标�
 - nemu_ipc 截图方案为 MuMu 模拟器专属（仅 Windows），macOS 上自动回退到 ADB 截图
 - 推荐使用 uiautomator2 截图方案获得更优性能
 - 打包命令：`uv run pyinstaller -y --clean WOA_AutoBot_mac.spec`
+
+### macOS 原生后端（实验性，无需模拟器 / ADB）
+> 直接操控 **Mac 原生版 WOA**（App Store「Designed for iPad」应用），无需安卓模拟器。详见 **[docs/MAC_NATIVE_BACKEND.md](docs/MAC_NATIVE_BACKEND.md)**。
+
+- `MacNativeController` 以与 `AdbController` 相同的接口工作，底层改用 **Quartz 截图 + `CGEvent` 合成鼠标**；macOS 上自动启用
+- 需授予 **屏幕录制** 与 **辅助功能** 权限；WOA 需保持**前台**（App Store iOS 应用要求）
+- 游戏语言需设为**简体中文**；现有 `icon/` 模板经**等比归一化**（缩放到宽 1600，不拉伸）即可复用，仅文字类模板按需重拍至 `icon_mac/`（覆盖优先）
+- 已打通：进场 / 离场 / 停机位地勤 / 地勤人数 OCR / Doing 服务派遣；其余流程按文档「逐流程校准配方」补齐
+- 校准工具：`python mac_calibrate.py content|snip|point|list`；冒烟测试：`python mac_debug.py`
 
 ## 快速开始
 
@@ -76,6 +86,13 @@ python gui_launcher.py
 ```
 
 ## 最近更新
+
+### 未发布 / Unreleased（开发中）
+- 🍎 **macOS 原生后端（实验性）**：新增 `MacNativeController`，可直接操控 **Mac 原生版 WOA**（无需安卓模拟器 / ADB）
+  - **等比 1600 宽归一化**（4:3 不拉伸）复用现有 `icon/` 模板 + `icon_mac/` 文字覆盖层，避免大规模重拍
+  - 已打通：进场 / 离场（直接起飞）/ 停机位地勤（滑块+启动地面保障）/ 地勤人数 OCR / Doing 服务派遣
+  - 新增模块：`mac_window.py` `mac_input.py` `mac_native_controller.py` `vision.py`（`VisionMixin`）`mac_debug.py` `mac_calibrate.py`
+  - 完整设计与「逐流程校准配方」见 **[docs/MAC_NATIVE_BACKEND.md](docs/MAC_NATIVE_BACKEND.md)**
 
 ### v1.4.1 (2026-06-17)
 - 🐛 **修复不起飞模式轮切Bug**：`stand_only→landing_stand_cycle` 计数器误重置导致进港↔停机坪永不切换
