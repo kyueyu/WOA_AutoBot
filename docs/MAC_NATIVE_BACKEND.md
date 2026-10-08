@@ -173,8 +173,10 @@ conda run -n woa pip install -r requirements.txt
 **待办 Remaining**
 - Doing 全部完成时的 **`地勤保障完成`** 领取按钮（文字模板，需在该状态出现时重拍）。
 - 离场其它状态：**后推 `push_back`**、**滑行 `taxi_to_runway`**（需推出的飞机）。
-- 领奖弹窗 `get_award_1..4`（`REGION_REWARD_RECOVERY` 已给 Mac 值，待验证）。
-- 除冰/维修/塔台流程、花费 OCR（task 数字）。
+- 领奖弹窗 `get_award_2..4`（`REGION_REWARD_RECOVERY` 已给 Mac 值，待验证；`get_award_1` 已在 WoA 3.7.0 实测通过）。
+- 跑道穿越 `cross_runway`（文字按钮，需重拍到 `icon_mac/`）。
+- 除冰/维修/塔台流程。
+- ~~花费 OCR~~：已完成——`REGION_TASK_COST=(270,970,60,25)`、`REGION_GREEN_DOT=(405,817,201,109)`（停机位面板比 16:9 下移约 +300），停机位任务从 ~8s 盲做降到 ~2s 按需分配。
 - 打包：`WOA_AutoBot_mac.spec` 需补 pyobjc hiddenimports + `icon_mac` datas + Info.plist `NSScreenCaptureUsageDescription`。
 
 ---

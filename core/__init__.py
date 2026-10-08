@@ -15,6 +15,7 @@ from core.platform import (
     unlock_file,
     try_lock_file,
     get_app_data_dir,
+    get_adb_bundled_path,
     safe_subprocess_run,
     safe_popen_wait,
 )
@@ -53,6 +54,11 @@ from core.constants import (
     REQUIRED_GUARD_MODULES,
     REF_WIDTH,
     REF_HEIGHT,
+    CORE_FILE_FINGERPRINTS,
+    FUSE_SIGNAL_PATH,
+    FUSE_REVOKE_KEYWORD,
+    FUSE_CHECK_INTERVAL_SEC,
+    FUSE_FIRST_CHECK_DELAY_SEC,
 )
 
 __all__ = [
@@ -76,4 +82,7 @@ __all__ = [
     "MAX_INSTANCES", "DEFAULT_FONT", "MONO_FONT",
     "MUMU_PORTS", "REQUIRED_GUARD_MODULES",
     "REF_WIDTH", "REF_HEIGHT",
+    "CORE_FILE_FINGERPRINTS",
+    "FUSE_SIGNAL_PATH", "FUSE_REVOKE_KEYWORD",
+    "FUSE_CHECK_INTERVAL_SEC", "FUSE_FIRST_CHECK_DELAY_SEC",
 ]

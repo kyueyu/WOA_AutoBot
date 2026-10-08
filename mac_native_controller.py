@@ -40,6 +40,8 @@ class MacNativeController(VisionMixin):
         self._think_min = 0.0
         self._think_max = 0.0
         self._content_rect = None  # (x, y, w, h)，截图像素空间内的游戏内容区
+        self._screenshot_cache = None
+        self._screenshot_cache_ts = 0.0
         self._load_calibration()
 
     # ─── 校准档案 ───────────────────────────────────────
@@ -184,6 +186,20 @@ class MacNativeController(VisionMixin):
                 return None
         return self._normalize_to_logical_resolution(img)
 
+    def get_screenshot_cached(self, max_age_ms=50):
+        now = time.time()
+        if self._screenshot_cache is not None and (now - self._screenshot_cache_ts) * 1000 < max_age_ms:
+            return self._screenshot_cache
+        img = self.get_screenshot()
+        if img is not None:
+            self._screenshot_cache = img
+            self._screenshot_cache_ts = now
+        return img
+
+    def invalidate_screenshot_cache(self):
+        self._screenshot_cache = None
+        self._screenshot_cache_ts = 0.0
+
     def get_pixel_color(self, x, y):
         screen = self.get_screenshot()
         if screen is None:
@@ -215,6 +231,7 @@ class MacNativeController(VisionMixin):
             return
         gx, gy = self._device_to_global(dev_x, dev_y)
         mac_input.click(gx, gy)
+        self.invalidate_screenshot_cache()
 
     def double_click(self, x, y, random_offset=20):
         if self._window is None:
@@ -223,6 +240,7 @@ class MacNativeController(VisionMixin):
         dev_x, dev_y = self._logical_to_device_point(int(round(x)), int(round(y)))
         gx, gy = self._device_to_global(dev_x, dev_y)
         mac_input.double_click(gx, gy)
+        self.invalidate_screenshot_cache()
 
     def swipe(self, x1, y1, x2, y2, duration_ms=1000):
         self._do_think()
@@ -231,6 +249,7 @@ class MacNativeController(VisionMixin):
         g1 = self._device_to_global(*self._logical_to_device_point(x1, y1))
         g2 = self._device_to_global(*self._logical_to_device_point(x2, y2))
         mac_input.drag(g1[0], g1[1], g2[0], g2[1], duration_ms=duration_ms)
+        self.invalidate_screenshot_cache()
 
     @staticmethod
     def scan_windows():

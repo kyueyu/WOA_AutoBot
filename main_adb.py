@@ -18,12 +18,67 @@ from core import (FEATURE_GUARD_TOKEN, get_resource_path,
 # Bot 引擎（所有方法已内联到 WoaBot 类中，bot/ 包中的 Mixin 已归档）
 # from bot import ConfigMixin, TowerMixin  # 已移除死继承
 
+# --- Web 控制面板（可选集成，多实例支持）---
+try:
+    from web_panel import bot_states as _wp_bot_states, update_frame as _wp_update_frame
+    _WEB_PANEL_AVAILABLE = True
+except ImportError:
+    _WEB_PANEL_AVAILABLE = False
+    _wp_bot_states = None
+    _wp_update_frame = None
+
 # 向后兼容别名
 WOA_FEATURE_GUARD_TOKEN = FEATURE_GUARD_TOKEN
+
+# ── 全局熔断标志（由 gui_launcher 设置，主循环运行时检测）──
+_GLOBAL_FUSE_BLOWN = False
+_GLOBAL_FUSE_REASON = ""
+
+def global_fuse_signal(reason=""):
+    """由 GUI 层调用，通知所有运行中的 Bot 实例立即停止。"""
+    global _GLOBAL_FUSE_BLOWN, _GLOBAL_FUSE_REASON
+    _GLOBAL_FUSE_BLOWN = True
+    _GLOBAL_FUSE_REASON = reason or "未知"
+
+def is_global_fuse_active():
+    return _GLOBAL_FUSE_BLOWN
 
 
 class WoaBot:
     def _check_running(self):
+        # 全局熔断检查（最高优先级）
+        if _GLOBAL_FUSE_BLOWN:
+            self.running = False
+            self.log(f"⛔ [熔断] 软件已被远程停用：{_GLOBAL_FUSE_REASON}")
+            raise StopSignal()
+        # Web 面板可远程停止（按当前实例）
+        if _WEB_PANEL_AVAILABLE and _wp_bot_states:
+            s = _wp_bot_states.get(self.instance_id, {})
+            if not s.get("running", True):
+                self.running = False
+        if not self.running:
+            raise StopSignal()
+
+    def _check_paused(self):
+        """暂停时阻塞等待，直到恢复运行或停止。"""
+        # Web 面板远程暂停/恢复同步（按当前实例）
+        if _WEB_PANEL_AVAILABLE and _wp_bot_states:
+            s = _wp_bot_states.get(self.instance_id, {})
+            wp_paused = s.get("paused", False)
+            wp_running = s.get("running", True)
+            if wp_paused and not self.paused:
+                self.paused = True
+            elif not wp_paused and self.paused:
+                self.paused = False
+            if not wp_running:
+                self.running = False
+        if not self.paused:
+            return
+        # 暂停时重置界面检测计时，避免恢复后立即触发防卡死
+        self.last_seen_main_interface_time = time.time()
+        self.last_periodic_check_time = 0.0
+        while self.paused and self.running:
+            time.sleep(0.15)
         if not self.running:
             raise StopSignal()
 
@@ -35,6 +90,7 @@ class WoaBot:
         self.target_device = None
         self.backend = "adb"  # "adb" | "mac_native"
         self.running = False
+        self.paused = False
         self._worker_thread = None
         self.log_callback = log_callback
         self.icon_path = get_resource_path('icon') + os.sep
@@ -144,6 +200,7 @@ class WoaBot:
         self.FILTER_MODE_STATES = {
             'mode1': {'arrival': False, 'ground': False, 'departure': False, 'pending': True},
             'mode2': {'arrival': False, 'ground': True,  'departure': False, 'pending': True},
+            'mode3': {'arrival': True,  'ground': True,  'departure': False, 'pending': True},
         }
         self.enable_no_takeoff_mode = False
         self.enable_standalone_logout = False
@@ -165,18 +222,11 @@ class WoaBot:
         self._tower_all_open_stable_count = 0    # 当前连续全开计数
         self._last_tower_all_open_state = False  # 上一次确认的全开状态
 
-        self._no_takeoff_cycle_side = 'landing'
-        self._no_takeoff_cycle_next_switch_time = 0.0
-        self._no_takeoff_switch_interval = 15.0
         self._request_switch_mode1 = False
         self._no_takeoff_auto_logout_interval = 30.0
         self._no_takeoff_auto_logout_next_time = 0.0
         self._standalone_logout_interval = 30.0
         self._standalone_logout_next_time = 0.0
-        # 不起飞策略稳定性保护
-        self._no_takeoff_last_strategy = 'stand_only'
-        self._no_takeoff_strategy_stable_count = 0
-        self._no_takeoff_strategy_stable_needed = 3
         self._stat_approach = 0
         self._stat_depart = 0
         self._stat_stand_count = 0
@@ -211,7 +261,7 @@ class WoaBot:
         self.thinking_mode = 0
         self.thinking_range = (0, 0)
         self._task_fail_cooldown = {}
-        self._task_fail_cooldown_sec = 5.0
+        self._task_fail_cooldown_sec = 3.0  # 失败任务冷却时间（秒），短暂冷却避免立即重试
         self._no_operable_count = 0
         self._no_operable_threshold = 3
         self._last_error_popup_check_ts = 0.0
@@ -243,25 +293,10 @@ class WoaBot:
         self.enable_no_takeoff_mode = enabled
         self.log(f">>> [配置] 不起飞模式: {'已开启' if enabled else '已关闭'}")
         if enabled:
-            self._no_takeoff_cycle_side = 'landing'
-            self._no_takeoff_cycle_next_switch_time = time.time() + self._no_takeoff_switch_interval
             self._schedule_no_takeoff_auto_logout()
         else:
             self._no_takeoff_auto_logout_next_time = 0.0
             self._request_switch_mode1 = True
-
-    def set_no_takeoff_switch_interval(self, seconds):
-        try:
-            interval = float(seconds)
-        except (TypeError, ValueError):
-            interval = 15.0
-        interval = max(3.0, min(300.0, interval))
-        if self._no_takeoff_switch_interval == interval:
-            return
-        self._no_takeoff_switch_interval = interval
-        self.log(f">>> [配置] 不起飞模式切换间隔: {interval:g} 秒")
-        if self.enable_no_takeoff_mode:
-            self._no_takeoff_cycle_next_switch_time = time.time() + self._no_takeoff_switch_interval
 
     def set_no_takeoff_auto_logout_interval(self, minutes):
         try:
@@ -387,50 +422,6 @@ class WoaBot:
                 return False
         return True
 
-    def _is_tower_all_open_by_pixels(self, screen):
-        """像素兜底：判断塔台四个控制器是否全部开启（非灰色即开启）。"""
-        if screen is None:
-            return False
-        tb, tg, tr = self.TOWER_OFF_COLOR
-        for (x, y) in self.TOWER_CHECK_POINTS:
-            try:
-                b, g, r = screen[y, x]
-                if self._color_diff((b, g, r), (tb, tg, tr)) <= 70:
-                    return False
-            except Exception:
-                return False
-        return True
-
-    def _is_tower_slot_active_by_pixels(self, screen, slot_index):
-        """像素检测单个塔台控制器是否激活（slot_index: 0-3 对应控制器1-4）。
-        非灰色即为激活。"""
-        if screen is None:
-            return False
-        tb, tg, tr = self.TOWER_OFF_COLOR
-        x, y = self.TOWER_CHECK_POINTS[slot_index]
-        try:
-            b, g, r = screen[y, x]
-            return self._color_diff((b, g, r), (tb, tg, tr)) > 70
-        except Exception:
-            return False
-
-    def _estimate_no_takeoff_strategy(self, screen):
-        """基于像素检测（非 OCR）判断不起飞策略，避免 OCR 波动导致误判。
-        返回: 'stand_only' 或 'landing_stand_cycle'"""
-        if screen is None:
-            # 无法截图时返回当前策略保持不变
-            return self._no_takeoff_last_strategy
-        if self._is_tower_all_open_by_pixels(screen):
-            return 'stand_only'
-        # 仅4号控制器激活？
-        t4_active = self._is_tower_slot_active_by_pixels(screen, 3)
-        t1_active = self._is_tower_slot_active_by_pixels(screen, 0)
-        t2_active = self._is_tower_slot_active_by_pixels(screen, 1)
-        t3_active = self._is_tower_slot_active_by_pixels(screen, 2)
-        if t4_active and not t1_active and not t2_active and not t3_active:
-            return 'landing_stand_cycle'
-        return 'stand_only'
-
     def _is_tower_icon_visible(self):
         """检测塔台图标是否可见（ROI 内匹配 tower.png）"""
         return self.safe_locate('tower.png', confidence=0.8, region=self.TOWER_ICON_ROI) is not None
@@ -497,7 +488,7 @@ class WoaBot:
     def _detect_filter_button_state(self, screen, btn):
         """用 on/off 模板比对一个按钮的选中状态，返回 True=选中, False=未选中, None=无法判断"""
         cx, cy = btn['click']
-        margin = 32
+        margin = 36  # 扩大搜索范围提高匹配鲁棒性
         roi = (cx - margin, cy - margin, margin * 2, margin * 2)
         score_on = self._match_template_score(screen, btn['tpl_on'], roi)
         score_off = self._match_template_score(screen, btn['tpl_off'], roi)
@@ -506,20 +497,21 @@ class WoaBot:
                 return False
             if score_off is None:
                 return True
+            # 降低判定阈值使相近分数也能正确区分
             if score_on >= score_off:
                 return True
-            if score_off - score_on > 0.08:
+            if score_off - score_on > 0.06:
                 return False
             return True
         # ── 模板缺失/匹配失败 → 像素回退 ──
         # 深色圆底=选中(on), 亮色圆底=未选中(off)
-        # 取 3×3 邻域均值抗锯齿
+        # 取 5×5 邻域均值提高抗锯齿能力
         h, w = screen.shape[:2]
         if cx >= w or cy >= h:
             return None
         samples = []
-        for ox in (-1, 0, 1):
-            for oy in (-1, 0, 1):
+        for ox in (-2, -1, 0, 1, 2):
+            for oy in (-2, -1, 0, 1, 2):
                 nx, ny = cx + ox, cy + oy
                 if 0 <= nx < w and 0 <= ny < h:
                     px = screen[ny, nx]
@@ -538,9 +530,10 @@ class WoaBot:
         # COLOR_DARK=(101,85,70) BGR   → 深灰圆底 → 选中(on)
         diff_light = abs(avg_b - self.COLOR_LIGHT[0]) + abs(avg_g - self.COLOR_LIGHT[1]) + abs(avg_r - self.COLOR_LIGHT[2])
         diff_dark  = abs(avg_b - self.COLOR_DARK[0])  + abs(avg_g - self.COLOR_DARK[1])  + abs(avg_r - self.COLOR_DARK[2])
-        if diff_dark < diff_light and diff_dark < 80:
+        # 放宽颜色容差以提高低画质下的识别率
+        if diff_dark < diff_light and diff_dark < 100:
             return True   # 接近深色 → 已选中(on)
-        if diff_light < diff_dark and diff_light < 80:
+        if diff_light < diff_dark and diff_light < 100:
             return False  # 接近亮色 → 未选中(off)
         return None       # 无法判断，不操作
 
@@ -571,7 +564,7 @@ class WoaBot:
             if self._is_pixel_dark(screen, mx, my):
                 return screen
             self._click_filter_point(mx, my)
-            self.sleep(0.3)
+            self.sleep(0.18)
         return self.adb.get_screenshot()
 
     def _apply_filter_state(self, expected_state, max_rounds=8):
@@ -583,7 +576,7 @@ class WoaBot:
             mx, my = self.FILTER_MENU_BTN
             if self._is_pixel_light(screen, mx, my):
                 self._click_filter_point(mx, my)
-                self.sleep(0.3)
+                self.sleep(0.18)
                 continue
             all_ok = True
             for btn in self.FILTER_BUTTONS:
@@ -597,14 +590,14 @@ class WoaBot:
                     continue
                 if current != want:
                     self._click_filter_point(*btn['click'])
-                    self.sleep(0.2)
+                    self.sleep(0.12)
                     all_ok = False
                     break
             if all_ok:
                 return
 
     def _matches_filter_mode3(self, screen):
-        """不起飞模式：菜单深色、待处理选中、离港不选，进港/机场内有且仅有一个选中"""
+        """不起飞模式：菜单深色、待处理选中、离港不选，进港与机场内同时选中"""
         mx, my = self.FILTER_MENU_BTN
         if not self._is_pixel_dark(screen, mx, my):
             return False
@@ -617,63 +610,7 @@ class WoaBot:
         b = state.get('ground')
         if a is None or b is None:
             return False
-        return (a and not b) or (not a and b)
-
-    def _get_mode3_side(self, screen):
-        """返回不起飞模式的当前侧：'landing' 或 'stand'，无法判断返回 None"""
-        state = self._detect_filter_state(screen)
-        a = state.get('arrival')
-        b = state.get('ground')
-        if a and not b:
-            return 'landing'
-        if b and not a:
-            return 'stand'
-        return None
-
-    # ── 不起飞模式策略（带稳定性保护） ──
-
-    def _get_no_takeoff_strategy(self):
-        """获取不起飞策略（带稳定性保护，防止像素/OCR瞬时波动导致误判）。
-        稳定条件：新策略需连续出现 _stable_needed 次才确认切换，
-        且 landing_stand_cycle → stand_only 的退出需要更严格的确认次数。"""
-        screen = self.adb.get_screenshot() if self.adb else None
-        new_strategy = self._estimate_no_takeoff_strategy(screen)
-
-        if new_strategy == self._no_takeoff_last_strategy:
-            self._no_takeoff_strategy_stable_count += 1
-        else:
-            # 从 landing_stand_cycle 退出需要更多确认（防止 OCR/像素波动）
-            if self._no_takeoff_last_strategy == 'landing_stand_cycle':
-                self._no_takeoff_strategy_stable_count += 1
-                # 需要 8 次连续不一致才退出（约 2 秒）
-                if self._no_takeoff_strategy_stable_count >= 8:
-                    self._no_takeoff_last_strategy = new_strategy
-                    self._no_takeoff_strategy_stable_count = 0
-                    self.log(f"📋 [不起飞] 策略变更: landing_stand_cycle → {new_strategy}")
-            else:
-                # 新策略与当前不同（如 stand_only → landing_stand_cycle），开始累计
-                self._no_takeoff_strategy_stable_count = 1
-
-        # 进入 landing_stand_cycle 需要常规稳定性确认（连续3次）
-        if (new_strategy != self._no_takeoff_last_strategy and
-            self._no_takeoff_last_strategy != 'landing_stand_cycle' and
-            self._no_takeoff_strategy_stable_count >= self._no_takeoff_strategy_stable_needed):
-            self._no_takeoff_last_strategy = new_strategy
-            self._no_takeoff_strategy_stable_count = 0
-            self.log(f"📋 [不起飞] 策略变更: → {new_strategy}")
-            # 刚进入 landing_stand_cycle 时立即安排第一次轮切，避免等满一个完整周期
-            if new_strategy == 'landing_stand_cycle':
-                self._no_takeoff_cycle_next_switch_time = time.time() + self._no_takeoff_switch_interval
-                self.log(f"📋 [不起飞] 进入轮切模式，{self._no_takeoff_switch_interval:g}s 后首次切换")
-
-        return self._no_takeoff_last_strategy
-
-    def _toggle_no_takeoff_cycle_side(self, reason="定时切换"):
-        """在 landing/stand 之间切换不起飞模式的轮切方向。"""
-        old = self._no_takeoff_cycle_side
-        self._no_takeoff_cycle_side = 'stand' if old == 'landing' else 'landing'
-        self._no_takeoff_cycle_next_switch_time = time.time() + self._no_takeoff_switch_interval
-        self.log(f"📋 [不起飞] {reason}，{old} → {self._no_takeoff_cycle_side}")
+        return bool(a and b)
 
     def _do_no_takeoff_small_logout(self):
         """不起飞模式小退：换机场 → 重进游戏 → 恢复处理。
@@ -683,8 +620,8 @@ class WoaBot:
         if not loc:
             self.log("📋 [小退] 未找到主界面按钮，跳过")
             return
-        self.adb.click(loc[0], loc[1], random_offset=5)
-        self.sleep(0.8)
+        self.adb.click(loc[0], loc[1], random_offset=8)
+        self.sleep(0.6)
         # 重试查找更改机场按钮（等待界面过渡完成）
         found_airport = False
         for _ in range(5):
@@ -692,7 +629,7 @@ class WoaBot:
             if self.find_and_click('change_airport.png', confidence=0.75, wait=0):
                 found_airport = True
                 break
-            self.sleep(0.4)
+            self.sleep(0.25)
         if not found_airport:
             self.log("📋 [小退] 未找到更改机场按钮，跳过")
             return
@@ -701,9 +638,9 @@ class WoaBot:
         t0 = time.time()
         while time.time() - t0 < 30.0:
             self._check_running()
-            if self.find_and_click('first_start_2.png', wait=0.5):
+            if self.find_and_click('first_start_2.png', wait=0.3):
                 break
-            self.sleep(0.5)
+            self.sleep(0.3)
         self.sleep(10.0)
         # 等待主界面出现（最多90s）
         wait_main = time.time()
@@ -720,7 +657,7 @@ class WoaBot:
                     self.log(f"🗼 [塔台] ⚠️ 小退后重检测失败: {e}")
                 self._periodic_15s_check(force_initial_filter_check=True)
                 return
-            self.sleep(1.0)
+            self.sleep(0.6)
         self.log("📋 [小退] 90s 内未检测到主界面，由后续流程处理")
 
     def _schedule_no_takeoff_auto_logout(self):
@@ -744,7 +681,7 @@ class WoaBot:
         self._apply_filter_state(mode1)
 
     def _click_filter_point(self, x, y):
-        self.adb.click(x, y, random_offset=5)
+        self.adb.click(x, y, random_offset=10)
 
     # ─── 分辨率自适应工具 ────────────────────────────────
     def _get_raw_resolution(self):
@@ -827,7 +764,7 @@ class WoaBot:
 
             # ====== 点击 ======
             self.adb._adb_click_fallback(dev_click_x, dev_click_y)
-            self.sleep(0.35)
+            self.sleep(0.2)
 
             # ====== 取点击后像素 ======
             screen_after = self.adb.get_screenshot()
@@ -872,7 +809,7 @@ class WoaBot:
         # ── 选中目标类别 ──
         cat = SIDEBAR_CATEGORIES[category_index]
         self._click_category(cat, f"选中 {cat['label']}", want_selected=True)
-        self.sleep(0.2)
+        self.sleep(0.1)
         self._current_category_index = category_index
 
     def _cycle_to_next_category(self):
@@ -914,9 +851,9 @@ class WoaBot:
         # 1.5 2D/3D 视角切换检测
         self._ensure_view_mode()
 
-        # 2. 中间领奖区防卡死：不论是否在主界面，均遍历寻找领奖按钮并点击直至恢复正常
+        # 2. 中间领奖区防卡死：快速扫描（最多5次）
         rx, ry, rw, rh = self.REGION_REWARD_RECOVERY
-        for _ in range(10):
+        for _ in range(5):
             screen = self.adb.get_screenshot()
             if screen is None:
                 break
@@ -926,8 +863,8 @@ class WoaBot:
                 res = self.adb.locate_image(self.icon_path + btn, confidence=0.65, screen_image=roi)
                 if res:
                     self.log(f"🚨 [15s周期检测] 在领奖区域内发现 {btn}，点击恢复...")
-                    self.adb.click(res[0] + rx, res[1] + ry, random_offset=3)
-                    self.sleep(1.0)
+                    self.adb.click(res[0] + rx, res[1] + ry, random_offset=6)
+                    self.sleep(0.3)
                     clicked = True
                     break
             if not clicked:
@@ -948,22 +885,9 @@ class WoaBot:
         is_mode3 = self.enable_no_takeoff_mode and self._matches_filter_mode3(screen)
 
         if self.enable_no_takeoff_mode:
-            strategy = self._get_no_takeoff_strategy()
-            if strategy == 'landing_stand_cycle':
-                current_side = self._get_mode3_side(screen) if is_mode3 else None
-                if current_side != self._no_takeoff_cycle_side:
-                    side_name = '待降落' if self._no_takeoff_cycle_side == 'landing' else '停机坪'
-                    self.log(f"📋 [不起飞] 应用{side_name}筛选")
-                    want_arrival = (self._no_takeoff_cycle_side == 'landing')
-                    mode3_state = {
-                        'arrival': want_arrival, 'ground': not want_arrival,
-                        'departure': False, 'pending': True
-                    }
-                    self._apply_filter_state(mode3_state)
-            else:
-                if not is_mode2:
-                    self.log("📋 [不起飞] stand_only → 切换停机坪筛选")
-                    self._apply_filter_state(mode2_state)
+            if not is_mode3:
+                self.log("📋 [不起飞] 应用待降落+停机坪筛选")
+                self._apply_filter_state(self.FILTER_MODE_STATES['mode3'])
             return
 
         if self.enable_filter_stand_only_when_tower_open and all(self._tower_active_slots):
@@ -1044,13 +968,13 @@ class WoaBot:
     def _run_pending_detection(self, list_roi_img):
         """按行识别：每行只保留该行内置信度最高的类型，避免跨行竞争导致相似图标误判。"""
         base_defs = [
-            ('pending_ice.png', self.handle_ice_task, 0.8, 'ice', 'task_ice'),
-            ('pending_repair.png', self.handle_repair_task, 0.8, 'repair', 'task_repair'),
-            ('pending_doing.png', self.handle_vehicle_check_task, 0.85, 'doing', 'task_doing'),
-            ('pending_approach.png', self.handle_approach_task, 0.8, 'approach', 'task_approach'),
-            ('pending_taxiing.png', self.handle_taxiing_task, 0.8, 'taxiing', 'task_taxiing'),
-            ('pending_takeoff.png', self.handle_takeoff_task, 0.8, 'takeoff', 'task_takeoff'),
-            ('pending_stand.png', self.handle_stand_task, 0.8, 'stand', 'task_stand')
+            ('pending_ice.png', self.handle_ice_task, 0.76, 'ice', 'task_ice'),
+            ('pending_repair.png', self.handle_repair_task, 0.76, 'repair', 'task_repair'),
+            ('pending_doing.png', self.handle_vehicle_check_task, 0.80, 'doing', 'task_doing'),
+            ('pending_approach.png', self.handle_approach_task, 0.72, 'approach', 'task_approach'),
+            ('pending_taxiing.png', self.handle_taxiing_task, 0.76, 'taxiing', 'task_taxiing'),
+            ('pending_takeoff.png', self.handle_takeoff_task, 0.76, 'takeoff', 'task_takeoff'),
+            ('pending_stand.png', self.handle_stand_task, 0.76, 'stand', 'task_stand')
         ]
         try:
             conf_override = float(os.environ.get("LIST_DETECT_CONF", "0"))
@@ -1098,11 +1022,19 @@ class WoaBot:
         return all_matches, final_tasks
 
     def _fast_locate_all(self, screen_roi, template_name, confidence=0.8):
+        """快速多目标模板匹配，支持自适应阈值回退以应对低对比度场景。
+        
+        策略：
+        1. 主阈值 = max(confidence - 0.03, 0.65)，略低于调用方置信度以容忍轻微形变
+        2. 无匹配时使用回退阈值 = max(confidence - 0.08, 0.62) 二次尝试
+        3. 8px 网格桶去重，避免相邻重复命中，兼顾分辨率与去重效果
+        """
         if template_name not in self.task_templates:
             return []
 
         template = self.task_templates[template_name]
-        if template is None: return []
+        if template is None:
+            return []
 
         try:
             res = cv2.matchTemplate(screen_roi, template, cv2.TM_CCOEFF_NORMED)
@@ -1110,12 +1042,22 @@ class WoaBot:
             return []
 
         h, w = template.shape[:2]
-        ys, xs = np.where(res >= confidence)
+
+        # 主阈值：略微宽松以容忍游戏画面轻微变化
+        primary_conf = max(confidence - 0.03, 0.65)
+        ys, xs = np.where(res >= primary_conf)
+
+        # 自适应回退：主阈值无结果时，放宽到更低阈值再试一次
+        if len(xs) == 0:
+            fallback_conf = max(confidence - 0.08, 0.62)
+            if fallback_conf < primary_conf:
+                ys, xs = np.where(res >= fallback_conf)
+
         if len(xs) == 0:
             return []
 
-        # 用 10px 网格桶聚合重复命中，保留每个桶内最高分，避免逐项 O(n^2) 去重。
-        bucket_size = 10
+        # 8px 网格桶聚合重复命中，保留每个桶内最高分
+        bucket_size = 8
         best_by_bucket = {}
         for x, y in zip(xs, ys):
             key = (int(x) // bucket_size, int(y) // bucket_size)
@@ -1340,9 +1282,11 @@ class WoaBot:
         # 左侧详情面板比 16:9 下移约 +430px，对应 ROI 改用覆盖实际位置的宽松区域。
         self.LIST_ROI_H = 1300                          # 任务列表贯穿全高
         self.REGION_STATUS_TITLE = (0, 400, 240, 800)   # 左panel状态标题(航班状态/到达)
-        self.REGION_VACANT_ROI = (420, 980, 860, 240)   # 底部机位选择条
+        self.REGION_VACANT_ROI = (420, 980, 860, 215)   # 底部机位选择条
         self.REGION_BOTTOM_ROI = (20, 1050, 360, 140)   # 左panel底部金色动作按钮(直接起飞/后推...)
         self.REGION_REWARD_RECOVERY = (300, 520, 1000, 450)  # 居中奖励弹窗(4:3下移)
+        self.REGION_TASK_COST = (270, 970, 60, 25)       # 左panel「地勤班组 0/6」需求人数(16:9 下移约+300)
+        self.REGION_GREEN_DOT = (405, 817, 201, 109)     # 地勤班组滑块绿点(16:9 下移约+300)
         self._build_icon_rois()                         # 用 Mac 区域重建 ICON_ROIS(否则仍是__init__的旧值)
 
     def _create_controller(self):
@@ -1375,6 +1319,21 @@ class WoaBot:
         self.mumu_path = (path or "").strip()
         if self.adb:
             self.adb.set_mumu_path(self.mumu_path)
+
+    def set_click_jitter(self, click_jitter, swipe_jitter):
+        """设置点击/滑动的随机偏移量（模拟人手操作）。"""
+        try:
+            click_jitter = max(1, min(30, int(click_jitter)))
+        except (TypeError, ValueError):
+            click_jitter = 6
+        try:
+            swipe_jitter = max(1, min(40, int(swipe_jitter)))
+        except (TypeError, ValueError):
+            swipe_jitter = 8
+        if self.adb:
+            self.adb.default_click_jitter = click_jitter
+            self.adb.default_swipe_jitter = swipe_jitter
+            self.log(f">>> [配置] 随机偏移: 点击±{click_jitter}px, 滑动±{swipe_jitter}px")
 
     def _is_module_enabled(self, module_name):
         if not self.module_flags.get(module_name, True):
@@ -1542,13 +1501,18 @@ class WoaBot:
             use_roi = True
             roi_x, roi_y, roi_w, roi_h = self.ICON_ROIS[image_name]
 
+        # 实时识图：使用缓存截图 + 更快的轮询间隔 (60ms)
+        poll_interval = 0.06
         while time.time() - start_time < timeout:
             self._check_running()
-            screen = self.adb.get_screenshot()
+            screen = self.adb.get_screenshot_cached(max_age_ms=50)
             if screen is None:
-                time.sleep(0.1)
+                time.sleep(poll_interval)
                 continue
             if use_roi:
+                if roi_y + roi_h > screen.shape[0] or roi_x + roi_w > screen.shape[1]:
+                    time.sleep(poll_interval)
+                    continue
                 search_img = screen[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
                 offset_x, offset_y = roi_x, roi_y
             else:
@@ -1563,7 +1527,7 @@ class WoaBot:
                 self.adb.click(real_x, real_y, random_offset=random_offset)
                 if click_wait > 0: self.sleep(click_wait)
                 return True
-            time.sleep(0.1)
+            time.sleep(poll_interval)
         return False
 
     def start(self):
@@ -1573,6 +1537,11 @@ class WoaBot:
         self._next_staff_recovery_probe_time = 0.0
         self.last_checked_avail_staff = -1
         self.last_window_close_time = time.time()
+        # 同步 Web 面板状态（当前实例）
+        if _WEB_PANEL_AVAILABLE and _wp_bot_states is not None:
+            s = _wp_bot_states.setdefault(self.instance_id, {"running": False, "paused": False, "log": "", "label": f"实例 {self.instance_id}", "screenshot_path": f"latest_frame_{self.instance_id}.jpg"})
+            s["running"] = True
+            s["paused"] = False
         # 初始化计数器
         self.consecutive_timeout_count = 0
         self.consecutive_errors = 0
@@ -1657,6 +1626,11 @@ class WoaBot:
 
     def stop(self):
         self.running = False
+        self.paused = False  # 停止时清除暂停状态
+        # 同步 Web 面板状态（当前实例）
+        if _WEB_PANEL_AVAILABLE and _wp_bot_states is not None and self.instance_id in _wp_bot_states:
+            _wp_bot_states[self.instance_id]["running"] = False
+            _wp_bot_states[self.instance_id]["paused"] = False
         self.log(">>> 正在停止脚本...")
         self._print_session_stats()
         self._save_stats_to_csv()
@@ -1672,6 +1646,58 @@ class WoaBot:
             pass
         import gc
         gc.collect()
+
+    def _show_sponsor_notice(self, hours=0):
+        """输出醒目赞助公告（GUI 终端自动渲染为金色加粗，跨平台兼容）。
+        hours=0 表示首次启动，>0 表示已运行时长。"""
+        W = 58  # 框内宽度（两个 ║ 之间的字符数）
+        B = lambda s: f"║{s:<{W}}║"  # 左对齐自动补齐到 W 宽度
+
+        self.log("")
+        self.log(f"╔{'═' * W}╗")
+        self.log(B(""))
+        self.log(B("  ⭐  WOA AutoBot — 永久免费开源项目  ⭐"))
+        self.log(B(""))
+        self.log(B("  若本脚本对您有帮助，欢迎自愿赞助支持维护与开发更新"))
+        self.log(B("  赞助方式：闲鱼搜索用户「MythZx」或主界面赞助窗口"))
+        self.log(B("  官方仓库：github.com/hjtr7mymht-dot/WOA_AutoBot"))
+        self.log(B("  QQ 反馈群：1067076460"))
+        self.log(B(""))
+        if hours > 0:
+            self.log(B(f"  已连续运行 {hours} 小时，感谢您的信任与支持！"))
+        else:
+            self.log(B("  感谢您的使用，本工具将努力为您提供稳定服务！"))
+        self.log(B(""))
+        self.log(f"╚{'═' * W}╝")
+        self.log("")
+
+    def pause(self):
+        """暂停脚本运行，保留所有状态，可通过 resume() 恢复。"""
+        if not self.running:
+            return
+        if self.paused:
+            return
+        self.paused = True
+        # 同步 Web 面板状态（当前实例）
+        if _WEB_PANEL_AVAILABLE and _wp_bot_states is not None and self.instance_id in _wp_bot_states:
+            _wp_bot_states[self.instance_id]["paused"] = True
+        self.log("⏸️ [暂停] 脚本已暂停，点击「继续」恢复运行")
+
+    def resume(self):
+        """恢复暂停的脚本。"""
+        if not self.running:
+            return
+        if not self.paused:
+            return
+        self.paused = False
+        # 同步 Web 面板状态（当前实例）
+        if _WEB_PANEL_AVAILABLE and _wp_bot_states is not None and self.instance_id in _wp_bot_states:
+            _wp_bot_states[self.instance_id]["paused"] = False
+        # 重置界面检测计时，防止暂停期间累计的"未检测到主界面"触发防卡死
+        self.last_seen_main_interface_time = time.time()
+        self.last_periodic_check_time = 0.0
+        self.last_window_close_time = time.time()
+        self.log("▶️ [继续] 脚本已恢复运行")
 
     def _print_session_stats(self):
         start = self._run_start_time
@@ -1698,13 +1724,16 @@ class WoaBot:
 
     def _add_stats_to_csv_date(self, target_date, a, d, sc, ss):
         """将 (a,d,sc,ss) 累加到 CSV 中 target_date 所在行。若 a+d+sc==0 则不写。
-        所有实例共用同一个 woa_stats.csv，使用文件锁防止并发写入冲突。"""
+        所有实例共用同一个 woa_stats.csv，使用文件锁防止并发写入冲突。
+        CSV 路径统一使用 get_app_data_dir()，与 GUI 端读取路径保持一致。"""
         import csv
         if a + d + sc == 0:
             return
         try:
             from platform_utils import lock_file, unlock_file
-            base_dir = os.path.dirname(os.path.abspath(__file__)) if not getattr(sys, "frozen", False) else os.path.dirname(sys.executable)
+            from core.platform import get_app_data_dir
+            base_dir = get_app_data_dir()
+            os.makedirs(base_dir, exist_ok=True)
             csv_path = os.path.join(base_dir, "woa_stats.csv")
             lock_path = csv_path + ".lock"
             header = ["date", "approach", "depart", "stand_count", "stand_staff"]
@@ -1788,9 +1817,10 @@ class WoaBot:
         self.log("[DEBUG] 主循环线程已启动")
         self.sleep(0.3)
         self.last_periodic_check_time = 0.0
-        if self.enable_no_takeoff_mode:
-            self._no_takeoff_cycle_side = 'landing'
-            self._no_takeoff_cycle_next_switch_time = time.time() + self._no_takeoff_switch_interval
+        # 每小时醒目公告定时器（首次启动后 1 小时触发）
+        self._next_hourly_notice_time = time.time() + 3600.0
+        # 启动时显示赞助公告
+        self._show_sponsor_notice(0)
         self._periodic_15s_check(force_initial_filter_check=True)
         if self.enable_no_takeoff_mode:
             self._schedule_no_takeoff_auto_logout()
@@ -1808,6 +1838,9 @@ class WoaBot:
         gc_counter = 0
         while self.running:
             try:
+                # ── 暂停检查（最高优先级）──
+                self._check_paused()
+                
                 if self._handle_server_error_popup():
                     idle_count = 0
                     continue
@@ -1846,16 +1879,15 @@ class WoaBot:
                     self._stat_date = now_date
                 if self._is_module_enabled('lifecycle'):
                     now_ts = time.time()
+                    # 每小时醒目公告
+                    if now_ts >= self._next_hourly_notice_time:
+                        self._next_hourly_notice_time = now_ts + 3600.0
+                        hours = int((now_ts - self._run_start_time) / 3600)
+                        self._show_sponsor_notice(hours)
                     # 请求切换回模式1（来自配置变更）
                     if self._request_switch_mode1:
                         self._request_switch_mode1 = False
                         self._force_switch_filter_mode1()
-                    # 不起飞模式：轮切定时切换
-                    if (self.enable_no_takeoff_mode and
-                        self._get_no_takeoff_strategy() == 'landing_stand_cycle' and
-                        now_ts >= self._no_takeoff_cycle_next_switch_time):
-                        self._toggle_no_takeoff_cycle_side(reason="定时切换")
-                        self._periodic_15s_check(force_initial_filter_check=True)
                     # 不起飞模式：自动小退
                     if (self.enable_no_takeoff_mode and
                         self._no_takeoff_auto_logout_next_time > 0 and
@@ -1876,19 +1908,27 @@ class WoaBot:
                         continue
                 did_work = self.scan_and_process() if self._is_module_enabled('scanner') else False
                 if did_work:
-                    self.sleep(0.03)
+                    # 任务完成 → 极速继续扫描
+                    self.sleep(0.008)
                     idle_count = 0
                 else:
                     if self._is_module_enabled('idle_recovery'):
-                        self.sleep(0.25)
+                        # 自适应空闲：短缺模式下放宽间隔降低 CPU
+                        if self.in_staff_shortage_mode:
+                            self.sleep(0.06)
+                        else:
+                            self.sleep(0.030)
                         idle_count += 1
-                        if idle_count == 15:
+                        # 约 1.5s 无任务 → 关窗防止卡在过渡界面
+                        if idle_count >= 50:
                             self.close_window()
+                            idle_count = 0
                     else:
-                        self.sleep(0.08)
+                        self.sleep(0.020)
                         idle_count = 0
+                # GC 频率降低，减少卡顿感
                 gc_counter += 1
-                if gc_counter > 120:
+                if gc_counter > 200:
                     gc.collect()
                     gc_counter = 0
             except StopSignal:
@@ -1945,19 +1985,20 @@ class WoaBot:
             return
         self.adb.double_click(self.CLOSE_X, self.CLOSE_Y, random_offset=30)
         self.last_window_close_time = time.time()
-        self.sleep(0.1)
+        self.sleep(0.05)
 
-    def find_and_click(self, image_name, confidence=0.8, wait=0.5, random_offset=5):
+    def find_and_click(self, image_name, confidence=0.78, wait=0.35, random_offset=10):
         self._check_running()
-        screen = self.adb.get_screenshot()
+        screen = self.adb.get_screenshot_cached(max_age_ms=40)
         if screen is None: return False
         search_img = screen
         offset_x, offset_y = 0, 0
         if image_name in self.ICON_ROIS:
             roi = self.ICON_ROIS[image_name]
             x, y, w, h = roi
-            search_img = screen[y:y + h, x:x + w]
-            offset_x, offset_y = x, y
+            if y + h <= screen.shape[0] and x + w <= screen.shape[1]:
+                search_img = screen[y:y + h, x:x + w]
+                offset_x, offset_y = x, y
         result = self.adb.locate_image(self.icon_path + image_name, confidence=confidence, screen_image=search_img)
         if result:
             self._check_running()
@@ -1974,11 +2015,13 @@ class WoaBot:
             return None
         if region is None:
             return self.adb.locate_image(self.icon_path + image_name, confidence=confidence)
-        screen = self.adb.get_screenshot()
+        screen = self.adb.get_screenshot_cached(max_age_ms=40)
         if screen is None: return None
         x, y, w, h = region
         x = max(0, int(x))
         y = max(0, int(y))
+        if y + h > screen.shape[0] or x + w > screen.shape[1]:
+            return None
         search_img = screen[y:y + h, x:x + w]
         result = self.adb.locate_image(self.icon_path + image_name, confidence=confidence, screen_image=search_img)
         if result:
@@ -2045,7 +2088,7 @@ class WoaBot:
             if any(status_hits.get(alias) for alias in _expected_aliases):
                 return True
             if attempt == 0:
-                self.sleep(0.15)
+                self.sleep(0.08)
 
         self.log(f"   -> 状态校验不匹配 ({expected_status_img})，尝试纠错...")
         full_screen = self.adb.get_screenshot()
@@ -2065,12 +2108,14 @@ class WoaBot:
                     except TypeError:
                         handler(None)
                     return False
-        self.sleep(0.2)
+        # 过渡画面可能还未完全渲染，稍等后最终尝试
+        self.sleep(0.15)
         full_screen = self.adb.get_screenshot()
         if full_screen is not None:
             status_hits = _scan_statuses(full_screen)
             if status_hits.get(expected_status_img):
                 return True
+            # 任何已知状态都接受，自行跳转
             found = next((img for img, _ in status_map if status_hits.get(img)), None)
             if found:
                 for img, handler in status_map:
@@ -2085,7 +2130,7 @@ class WoaBot:
                         except TypeError:
                             handler(None)
                         return False
-        self.log("   -> 未知状态，退出")
+        self.log("   -> 未知状态，平滑退出")
         self.close_window()
         return False
 
@@ -2187,8 +2232,8 @@ class WoaBot:
 
         self.log("⚠️ [异常弹窗] 检测到服务器错误弹窗，正在点击“好的”关闭...")
         for _ in range(3):
-            self.adb.click(ok_pos[0], ok_pos[1], random_offset=4)
-            self.sleep(0.35)
+            self.adb.click(ok_pos[0], ok_pos[1], random_offset=8)
+            self.sleep(0.18)
             next_screen = self.adb.get_screenshot()
             next_ok = self._locate_on_screen('error_ok.png', next_screen, confidence=0.75)
             if not next_ok:
@@ -2465,7 +2510,7 @@ class WoaBot:
                 if yes_pos:
                     # 点击二次确认按钮（优先使用模板匹配位置，回退到固定坐标）
                     self.log("   🗼 点击二次确认 (yes.png)")
-                    self.adb.click(yes_pos[0], yes_pos[1], random_offset=3)
+                    self.adb.click(yes_pos[0], yes_pos[1], random_offset=8)
                     self.sleep(0.4)
                     # 验证弹窗消失
                     verify = self.adb.get_screenshot()
@@ -2473,7 +2518,7 @@ class WoaBot:
                         second_ok = True
                         break
                     # 仍在，用固定坐标点击重试
-                    self.adb.click(715, 546, random_offset=3)
+                    self.adb.click(715, 546, random_offset=8)
                     self.sleep(0.4)
                     verify2 = self.adb.get_screenshot()
                     if verify2 is not None and not self._locate_on_screen('yes.png', verify2, confidence=0.75):
@@ -2481,7 +2526,7 @@ class WoaBot:
                         break
                 else:
                     # 模板匹配未找到，尝试固定坐标盲点
-                    self.adb.click(715, 546, random_offset=3)
+                    self.adb.click(715, 546, random_offset=8)
                     self.sleep(0.4)
                     verify3 = self.adb.get_screenshot()
                     if verify3 is not None and not self._locate_on_screen('yes.png', verify3, confidence=0.75):
@@ -2664,9 +2709,17 @@ class WoaBot:
         still_confirm = self._locate_on_screen('buy_vehicle_confirm.png', verify_screen, confidence=0.78)
         return not (still_buy or still_confirm)
 
+    @staticmethod
+    def _has_red_badge(screen, cx, cy):
+        # 金色服务图标右上角的红色「!」角标 = 车辆不足（即 red_warning.png），点击无法派遣
+        roi = cv2.cvtColor(screen[max(0, cy - 40):cy, cx:cx + 40], cv2.COLOR_BGR2HSV)
+        red = cv2.inRange(roi, (0, 120, 120), (10, 255, 255)) | cv2.inRange(roi, (170, 120, 120), (180, 255, 255))
+        return cv2.countNonZero(red) >= 40
+
     def _mac_ground_service_hits(self, screen):
         # Mac：底部「地面保障」面板中金色高亮的服务图标=就绪可派遣，按颜色检测其圆形图标。
         # 面板左固定右生长，服务>6 时向右延伸；x 上限取 1300（避开 x≳1320 的任务列表）。
+        # 带红色角标的跳过，交给下方 red_warning（车辆不足）分支处理，否则会无限重复点击。
         x0, y0, x1, y1 = 380, 1000, 1300, 1160
         band = screen[y0:y1, x0:x1]
         hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
@@ -2676,7 +2729,9 @@ class WoaBot:
         for ct in contours:
             x, y, w, h = cv2.boundingRect(ct)
             if w >= 30 and h >= 30 and 0.55 < w / h < 1.8:
-                hits.append((x0 + x + w // 2, y0 + y + h // 2))
+                cx, cy = x0 + x + w // 2, y0 + y + h // 2
+                if not self._has_red_badge(screen, cx, cy):
+                    hits.append((cx, cy))
         return hits
 
     def handle_vehicle_check_task(self, target_pos=None):
@@ -2701,7 +2756,7 @@ class WoaBot:
             self._no_operable_count = 0
             if self.enable_vehicle_buy:
                 self.log("   -> 🚨 发现车辆不足，准备购买")
-                self.adb.click(red_warn[0], red_warn[1], random_offset=1)
+                self.adb.click(red_warn[0], red_warn[1], random_offset=6)
                 self.sleep(0.5)
                 bought = False
                 if self.wait_and_click('buy_vehicle.png', timeout=2.0, click_wait=1.0):
@@ -2771,8 +2826,10 @@ class WoaBot:
         self.log(">>> [任务] 处理进场...")
 
         is_fast = getattr(self.adb, 'screenshot_method', 'adb') in ('nemu_ipc', 'uiautomator2')
-        approach_deadline = time.time() + (2.0 if is_fast else 4.5) + random.uniform(0, 0.6)
+        # 延长超时：机位分配→确认→等待降落按钮需要更长时间
+        approach_deadline = time.time() + (3.0 if is_fast else 6.0) + random.uniform(0, 0.8)
         assigned_stand = False
+        _stand_just_assigned = False  # 标记刚分配机位，跳过当轮 B 检测
 
         def _rclick(x, y, r=8):
             """拟人点击：高斯偏移 ±r px"""
@@ -2803,15 +2860,18 @@ class WoaBot:
                         ax, ay = 490, 770
                     self.log(f"   -> 分配机位 @ ({ax},{ay})")
                     _rclick(ax, ay)
-                    _rwait(0.25)
+                    _rwait(0.3)
                     vfy = self.adb.get_screenshot()
                     if vfy is not None and self.adb.locate_image(
                         self.icon_path + 'stand_vacant_on.png', confidence=0.7, screen_image=vfy):
                         self.log("   -> ✓ 机位已选中")
                     assigned_stand = True
+                    _stand_just_assigned = True
+                    # 刚分配完机位，跳过本轮 B 检测（用的是旧截图），下一轮再查
+                    continue
 
             # ── 步骤 B：已分配机位 → 全屏找确认/降落按钮 ──
-            if assigned_stand:
+            if assigned_stand and not _stand_just_assigned:
                 # B1：全屏检查降落按钮
                 lp = self.adb.locate_image(self.icon_path + 'landing_permitted.png',
                                            confidence=0.7, screen_image=screen)
@@ -2827,14 +2887,15 @@ class WoaBot:
                     self.log("   -> 🚫 跑道被占用，禁止降落")
                     return True
 
-                # B2：全屏找确认按钮
-                sc = self._locate_on_screen('stand_confirm.png', screen, confidence=0.75)
+                # B2：全屏找确认按钮（降低阈值提高检出率）
+                sc = self._locate_on_screen('stand_confirm.png', screen, confidence=0.7)
                 if sc:
+                    self.log("   -> 点击确认机位")
                     _rclick(sc[0], sc[1])
-                    _rwait(0.2, 0.08)
+                    _rwait(0.3, 0.1)
 
-                # B3：全屏等待降落按钮
-                post_deadline = time.time() + (5.0 if is_fast else 8.0) + random.uniform(0, 1.5)
+                # B3：全屏等待降落按钮（循环中也检测 stand_confirm 兜底）
+                post_deadline = time.time() + (6.0 if is_fast else 10.0) + random.uniform(0, 1.5)
                 while time.time() < post_deadline:
                     self._check_running()
                     s2 = self.adb.get_screenshot()
@@ -2844,6 +2905,13 @@ class WoaBot:
                                               confidence=0.8, region=self.REGION_MAIN_ANCHOR):
                         self.log("   -> ℹ️ 窗口已关闭，判定为塔台接管")
                         return True
+                    # B3 中也检测 stand_confirm，兜底 B2 可能的漏检
+                    sc2 = self._locate_on_screen('stand_confirm.png', s2, confidence=0.7)
+                    if sc2:
+                        self.log("   -> B3兜底：点击确认机位")
+                        _rclick(sc2[0], sc2[1])
+                        _rwait(0.3, 0.1)
+                        continue
                     lp2 = self.adb.locate_image(self.icon_path + 'landing_permitted.png',
                                                 confidence=0.7, screen_image=s2)
                     if lp2:
@@ -2857,10 +2925,14 @@ class WoaBot:
                     if lpro2:
                         self.log("   -> 🚫 跑道被占用，禁止降落")
                         return True
-                    time.sleep(random.uniform(0.12, 0.18))
+                    time.sleep(random.uniform(0.08, 0.12))
                 self.log("   -> ℹ️ 超时未检测到降落按钮，关闭窗口")
                 self.close_window()
                 return True
+
+            # 清除"刚分配"标记（下一轮正常进入 B 检测）
+            if _stand_just_assigned:
+                _stand_just_assigned = False
 
             # ── 步骤 C：全屏搜 landing_permitted（飞机已有停机位）──
             lp = self.adb.locate_image(self.icon_path + 'landing_permitted.png',
@@ -2872,7 +2944,7 @@ class WoaBot:
                 _rwait(0.05, 0.03)
                 return True
 
-            time.sleep(random.uniform(0.10, 0.15))
+            time.sleep(random.uniform(0.06, 0.10))
 
         self.log("⚠️ 进场超时")
         self.close_window()
@@ -2913,12 +2985,12 @@ class WoaBot:
                     reward_x = rres[0] + rx
                     reward_y = rres[1] + ry
                     self.log(f"   -> 🎁 [奖励区] 发现 {rbtn}，进入领奖流程")
-                    self.adb.click(reward_x, reward_y)
-                    self.sleep(0.4)
+                    self.adb.click(reward_x, reward_y, random_offset=8)
+                    self.sleep(0.3)
                     got_step2 = False
                     t2_start = time.time()
                     def _reward_step2_click(name):
-                        return self.find_and_click(name, confidence=0.72, wait=0.6, random_offset=3)
+                        return self.find_and_click(name, confidence=0.72, wait=0.5, random_offset=8)
                     while time.time() - t2_start < 15.0:
                         self._check_running()
                         if _reward_step2_click('get_award_2.png') or \
@@ -2949,13 +3021,13 @@ class WoaBot:
                                 if final_btn in ('push_back.png', 'taxi_to_runway.png'):
                                     self._stat_depart += 1
                                     self._stat_session_depart += 1
-                                self.adb.click(res_final[0] + bx, res_final[1] + by)
+                                self.adb.click(res_final[0] + bx, res_final[1] + by, random_offset=8)
                                 self.log("   -> ✅ 离场动作执行完毕")
                                 return True
-                        time.sleep(0.1)
+                        time.sleep(0.06)
                     if self.safe_locate('green_dot.png', region=self.REGION_GREEN_DOT):
                         self.log("   -> ⚠️ 检测到绿点，跳转至地勤分配...")
-                        self.sleep(0.5)
+                        self.sleep(0.3)
                         return self.handle_stand_task()
                     self.log("   -> ℹ️ 未检测到绿点，判定为塔台已接管")
                     return True
@@ -2974,10 +3046,10 @@ class WoaBot:
                     if btn in ('push_back.png', 'taxi_to_runway.png'):
                         self._stat_depart += 1
                         self._stat_session_depart += 1
-                    self.adb.click(x, y)
-                    self.sleep(0.5)
+                    self.adb.click(x, y, random_offset=8)
+                    self.sleep(0.25)
                     return True
-            time.sleep(0.1)
+            time.sleep(0.06)
         self.log("⚠️ 离场任务扫描超时")
         self.close_window()
         return False
@@ -2998,7 +3070,7 @@ class WoaBot:
                     is_read_success = True
                     self._update_staff_tracker(val)
                     break
-                self.sleep(0.2)
+                self.sleep(0.12)
             if avail_staff is None:
                 self.log("⚠️ 无法读取地勤人数，尝试盲做")
                 self._update_staff_tracker(None)
@@ -3060,11 +3132,15 @@ class WoaBot:
                 return True
             # 逐架跳过而非全局阻断：仅跳过当前不能满足的飞机
             self.stand_skip_index += 1
-            # 连续3架以上都失败才进入全局短缺模式
+            # 连续3架以上都失败才进入全局短缺模式，且冷却日志避免刷屏
             if self.stand_skip_index >= 3:
                 self.in_staff_shortage_mode = True
                 self._next_staff_recovery_probe_time = time.time() + self._staff_recovery_probe_interval
-                self.log(f"🛑 连续 {self.stand_skip_index} 架均人力不足，进入短缺模式，{self._staff_recovery_probe_interval}s 后探测恢复")
+                now_ts = time.time()
+                last_log = getattr(self, '_last_staff_shortage_log_ts', 0.0)
+                if now_ts - last_log > 8.0:  # 8秒内不重复刷短缺日志
+                    self.log(f"🛑 连续 {self.stand_skip_index} 架均人力不足，进入短缺模式，{self._staff_recovery_probe_interval}s 后探测恢复")
+                    self._last_staff_shortage_log_ts = now_ts
             self.last_known_available_staff = avail_staff
             return False
 
@@ -3277,33 +3353,33 @@ class WoaBot:
             self._record_anti_stuck_trigger(f"未检测到主界面已 {int(elapsed)} 秒，尝试强行返回")
 
             # First Start 恢复逻辑
-            if self.find_and_click('first_start_1.png', wait=0.5):
+            if self.find_and_click('first_start_1.png', wait=0.3):
                 self.log("   -> 尝试 First Start 恢复流程...")
                 fs_start = time.time()
                 found_step2 = False
-                while time.time() - fs_start < 5.0:
+                while time.time() - fs_start < 4.0:
                     self._check_running()
-                    if self.find_and_click('first_start_2.png', wait=0.5):
+                    if self.find_and_click('first_start_2.png', wait=0.3):
                         found_step2 = True
                         break
-                    self.sleep(0.5)
+                    self.sleep(0.3)
 
                 if found_step2:
                     self.log("   -> 正在等待返回主界面...")
                     wait_main = time.time()
-                    while time.time() - wait_main < 20.0:
+                    while time.time() - wait_main < 15.0:
                         self._check_running()
                         if self.safe_locate('main_interface.png', region=self.REGION_MAIN_ANCHOR, confidence=0.8):
                             self.last_seen_main_interface_time = time.time()
                             self.log("   -> ✅ 恢复成功")
                             return
-                        self.sleep(1.0)
+                        self.sleep(0.5)
 
-            if self.wait_and_click('back.png', timeout=1.0, click_wait=0.5, random_offset=2):
+            if self.wait_and_click('back.png', timeout=0.8, click_wait=0.3, random_offset=2):
                 self.log("   -> 点击了 Back 按钮")
                 self.last_seen_main_interface_time = time.time()
                 return
-            if self.wait_and_click('cancel.png', timeout=1.0, click_wait=0.5):
+            if self.wait_and_click('cancel.png', timeout=0.8, click_wait=0.3):
                 self.log("   -> 点击了 Cancel 按钮")
                 self.last_seen_main_interface_time = time.time()
                 return
@@ -3331,8 +3407,10 @@ class WoaBot:
             self._task_fail_cooldown.pop(k, None)
 
     def _execute_task(self, task):
-        self.log(f"识别结果: {task['name']} (分数: {task['score']:.2f})")
-        self.adb.click(task['center'][0] + 60, task['center'][1], random_offset=3)
+        # 短缺模式下跳过冗余日志，减少 I/O 卡顿
+        if not (self.in_staff_shortage_mode and task['type'] == 'stand'):
+            self.log(f"识别结果: {task['name']} (分数: {task['score']:.2f})")
+        self.adb.click(task['center'][0] + 60, task['center'][1], random_offset=8)
         try:
             result = task['handler']()
         except (StopSignal, KeyboardInterrupt, SystemExit):
@@ -3348,16 +3426,217 @@ class WoaBot:
         self.log(f"📋 [调度] 当前任务未满足，自动切换下一任务: {task['name']}")
         return False
 
-    def scan_and_process(self):
-        current_screen = self.adb.get_screenshot()
-        self._check_and_recover_interface(current_screen=current_screen)
-        self._periodic_15s_check()
-        self._cleanup_task_cooldown()
+    # ═══════════════════════════════════════════════════════════
+    #  实时智能状态机 — 秒级响应核心
+    # ═══════════════════════════════════════════════════════════
 
-        if current_screen is None:
+    # 游戏界面状态枚举
+    STATE_MAIN = 'main'             # 主界面（可看到飞机列表）
+    STATE_TASK_DETAIL = 'task'      # 任务详情弹窗
+    STATE_TOWER_MENU = 'tower'      # 塔台菜单
+    STATE_POPUP = 'popup'           # 弹窗（领奖/错误/确认）
+    STATE_UNKNOWN = 'unknown'       # 无法识别
+    STATE_TRANSITION = 'transition' # 界面切换过渡中
+
+    def _quick_detect_state(self, screen):
+        """毫秒级游戏界面状态识别（纯视觉，零 OCR）。
+        
+        检测顺序按出现频率排序，命中即返回，避免全量扫描。
+        利用截图缓存，连续调用不会重复抓取。
+        """
+        if screen is None:
+            return self.STATE_UNKNOWN
+
+        h, w = screen.shape[:2]
+        # 边界检查
+        if h < 100 or w < 100:
+            return self.STATE_UNKNOWN
+
+        # 1. 主界面检测（最高频，优先检查主界面锚点图标）
+        loc = self.adb.locate_image(
+            self.icon_path + 'main_interface.png',
+            confidence=0.75,
+            screen_image=screen[self.REGION_MAIN_ANCHOR[1]:self.REGION_MAIN_ANCHOR[1]+self.REGION_MAIN_ANCHOR[3],
+                                self.REGION_MAIN_ANCHOR[0]:self.REGION_MAIN_ANCHOR[0]+self.REGION_MAIN_ANCHOR[2]]
+        )
+        if loc is not None:
+            return self.STATE_MAIN
+
+        # 2. 任务详情弹窗（检测任务状态图标区域）
+        rx, ry, rw, rh = self.REGION_STATUS_TITLE
+        if ry + rh <= h and rx + rw <= w:
+            status_icons = ['status_stand.png', 'status_takeoff.png', 'status_taxiing.png',
+                           'status_approach.png', 'status_ice.png', 'status_doing.png']
+            status_roi = screen[ry:ry+rh, rx:rx+rw]
+            for icon in status_icons:
+                if self.adb.locate_image(self.icon_path + icon, confidence=0.7, screen_image=status_roi):
+                    return self.STATE_TASK_DETAIL
+
+        # 3. 塔台菜单（检测 tower_1.png）
+        tower_roi_y, tower_roi_h = 271, 56
+        tower_roi_x, tower_roi_w = 32, 58
+        if tower_roi_y + tower_roi_h <= h and tower_roi_x + tower_roi_w <= w:
+            tower_roi = screen[tower_roi_y:tower_roi_y+tower_roi_h, tower_roi_x:tower_roi_x+tower_roi_w]
+            if self.adb.locate_image(self.icon_path + 'tower_1.png', confidence=0.78, screen_image=tower_roi):
+                return self.STATE_TOWER_MENU
+
+        # 4. 弹窗检测（error_ok, yes, delay 等）
+        popup_icons = ['error_ok.png', 'yes.png', 'delay.png', 'delay_1.png',
+                       'get_award_1.png', 'get_award_2.png', 'get_award_3.png', 'get_award_4.png']
+        for icon in popup_icons:
+            if self.adb.locate_image(self.icon_path + icon, confidence=0.65, screen_image=screen):
+                return self.STATE_POPUP
+
+        return self.STATE_UNKNOWN
+
+    def _handle_popup_state(self, screen):
+        """智能弹窗处理：根据弹窗类型自动选择合适的关闭方式。"""
+        # 错误弹窗
+        pos = self._locate_on_screen('error_ok.png', screen, confidence=0.75)
+        if pos:
+            self.log("⚡ [秒处理] 检测到错误弹窗，自动关闭")
+            self.adb.click(pos[0], pos[1], random_offset=8)
+            self.sleep(0.1)
+            return True
+        # 确认弹窗
+        pos = self._locate_on_screen('yes.png', screen, confidence=0.72)
+        if pos:
+            self.log("⚡ [秒处理] 检测到确认弹窗，自动点击")
+            self.adb.click(pos[0], pos[1], random_offset=8)
+            self.sleep(0.1)
+            return True
+        # 延时弹窗
+        for btn in ('delay.png', 'delay_1.png'):
+            pos = self._locate_on_screen(btn, screen, confidence=0.7)
+            if pos:
+                self.log(f"⚡ [秒处理] 检测到延时弹窗({btn})，自动确认")
+                self.adb.click(pos[0], pos[1], random_offset=5)
+                self.sleep(0.1)
+                return True
+        # 领奖弹窗
+        rx, ry, rw, rh = self.REGION_REWARD_RECOVERY
+        if ry + rh <= screen.shape[0] and rx + rw <= screen.shape[1]:
+            reward_roi = screen[ry:ry+rh, rx:rx+rw]
+            for btn in ('get_award_1.png', 'get_award_2.png', 'get_award_3.png', 'get_award_4.png'):
+                pos = self.adb.locate_image(self.icon_path + btn, confidence=0.6, screen_image=reward_roi)
+                if pos:
+                    self.log(f"⚡ [秒处理] 检测到领奖弹窗({btn})，自动领取")
+                    self.adb.click(pos[0] + rx, pos[1] + ry, random_offset=8)
+                    self.sleep(0.15)
+                    return True
+        return False
+
+    def _scan_tasks_ultra_fast(self, screen):
+        """超快速任务检测：单帧内并行匹配所有任务类型，返回匹配列表。
+        
+        优化要点：
+        1. 复用截图缓存，不重复抓取
+        2. 单次遍历所有模板，避免多次 matchTemplate 调用
+        3. 仅扫描任务列表 ROI 列（60px 宽），大幅减少计算量
+        """
+        lx, ly, lw = self.LIST_ROI_X, 0, self.LIST_ROI_W
+        lh = min(self.LIST_ROI_H, screen.shape[0])
+        if screen.shape[1] < lx + lw:
+            return []
+        list_roi = screen[ly:ly+lh, lx:lx+lw]
+
+        all_matches = []
+        for name, tmpl in self.task_templates.items():
+            if tmpl is None:
+                continue
+            try:
+                res = cv2.matchTemplate(list_roi, tmpl, cv2.TM_CCOEFF_NORMED)
+            except Exception:
+                continue
+
+            # 动态阈值：根据图标类型微调
+            base_conf = 0.70
+            if 'doing' in name:
+                base_conf = 0.76
+            elif 'approach' in name:
+                base_conf = 0.68
+            elif 'stand' in name:
+                base_conf = 0.72
+            if self.backend == "mac_native":
+                # Mac 渲染下非待处理行(预约闹钟/进行中灰标)与任务模板相似度可达 0.70~0.81，真实待处理行 ≥0.88：统一 0.85，且不做宽松回退
+                base_conf = 0.85
+
+            ys, xs = np.where(res >= base_conf)
+            if len(xs) == 0 and self.backend != "mac_native":
+                # 宽松回退
+                fallback = max(base_conf - 0.06, 0.62)
+                ys, xs = np.where(res >= fallback)
+
+            bucket = {}
+            for x, y in zip(xs, ys):
+                key = (int(x) // 8, int(y) // 8)
+                score = float(res[y, x])
+                old = bucket.get(key)
+                if old is None or score > old['score']:
+                    bucket[key] = {
+                        'center': (int(x) + tmpl.shape[1] // 2 + lx, int(y) + tmpl.shape[0] // 2),
+                        'score': score,
+                        'name': name,
+                    }
+            all_matches.extend(bucket.values())
+
+        if not all_matches:
+            return []
+
+        # 按行分组取最高分
+        all_matches.sort(key=lambda d: d['center'][1])
+        final = []
+        i = 0
+        while i < len(all_matches):
+            row = [all_matches[i]]
+            anchor_y = all_matches[i]['center'][1]
+            j = i + 1
+            while j < len(all_matches) and abs(all_matches[j]['center'][1] - anchor_y) <= 24:
+                row.append(all_matches[j])
+                j += 1
+            best = max(row, key=lambda d: d['score'])
+            final.append(best)
+            i = j
+        return final
+
+    def _map_task_to_handler(self, match_info):
+        """将匹配结果映射到处理函数和任务类型。"""
+        name = match_info['name']
+        mapping = {
+            'pending_ice.png':     ('ice',     self.handle_ice_task,         'task_ice'),
+            'pending_repair.png':  ('repair',  self.handle_repair_task,      'task_repair'),
+            'pending_doing.png':   ('doing',   self.handle_vehicle_check_task, 'task_doing'),
+            'pending_approach.png':('approach',self.handle_approach_task,    'task_approach'),
+            'pending_taxiing.png': ('taxiing', self.handle_taxiing_task,     'task_taxiing'),
+            'pending_takeoff.png': ('takeoff', self.handle_takeoff_task,     'task_takeoff'),
+            'pending_stand.png':   ('stand',   self.handle_stand_task,       'task_stand'),
+        }
+        t_type, handler, module = mapping.get(name, ('other', None, None))
+        if module and not self._is_module_enabled(module):
+            return None
+        return {
+            'type': t_type,
+            'handler': handler,
+            'score': match_info['score'],
+            'name': name,
+            'center': match_info['center'],
+        }
+
+    def scan_and_process(self):
+        """智能秒级扫描：状态机驱动 + 截图缓存 + 超快速任务检测。
+        
+        流程：
+        1. 获取截图（缓存复用）
+        2. 快速状态检测 → 弹窗/过渡态立即处理
+        3. 仅在主界面执行任务扫描
+        4. 匹配到任务即刻执行
+        """
+        # 使用缓存截图，同一帧内所有检测共享
+        screen = self.adb.get_screenshot_cached(max_age_ms=30)
+        if screen is None:
             self._scan_screenshot_fails += 1
             if self._scan_screenshot_fails >= 5:
-                self.log(f"⚠️ [连接] 截图连续{self._scan_screenshot_fails}次失败，尝试重建 ADB 连接...")
+                self.log(f"⚠️ [连接] 截图连续{self._scan_screenshot_fails}次失败，尝试重建...")
                 self._scan_screenshot_fails = 0
                 try:
                     self.adb.connect()
@@ -3367,108 +3646,158 @@ class WoaBot:
                 self.sleep(1.0)
             return False
         self._scan_screenshot_fails = 0
+        # 推送截图到 Web 控制面板（如果可用，按当前实例）
+        if _WEB_PANEL_AVAILABLE and _wp_update_frame is not None:
+            try:
+                _wp_update_frame(screen, self.instance_id)
+            except Exception:
+                pass
 
+        # ── 阶段 0：快速状态检测 ──
+        state = self._quick_detect_state(screen)
+
+        # 弹窗 → 秒处理
+        if state == self.STATE_POPUP and self._handle_popup_state(screen):
+            self.sleep(0.03)
+            return True
+
+        # 非主界面（过渡/未知/塔台菜单）→ 尝试关窗回归主界面
+        if state == self.STATE_TOWER_MENU:
+            self.log("⚡ [状态] 检测到塔台菜单，关闭回归主界面")
+            self._close_tower_menu(fast=True)
+            return True
+
+        if state == self.STATE_TASK_DETAIL:
+            # 已在任务详情中，由各 handler 内部处理，此处仅做界面恢复
+            self._check_and_recover_interface(current_screen=screen)
+            return False
+
+        if state != self.STATE_MAIN:
+            # 过渡态或未知态 → 防卡死恢复 + 周期性检查 + 尝试关窗
+            self._check_and_recover_interface(current_screen=screen)
+            self._periodic_15s_check()
+            if self._check_and_perform_auto_delay(screen):
+                return True
+            return False
+
+        # ── 阶段 1：主界面常规维护 ──
+        self._check_and_recover_interface(current_screen=screen)
+        self._periodic_15s_check()
+        self._cleanup_task_cooldown()
+
+        # ── 阶段 2：红灯最高优先级 ──
+        if self._check_and_perform_auto_delay(screen):
+            return True
+
+        # ── 阶段 3：实时地勤检测（绿点快速预检 + OCR）──
         now = time.time()
-        prev_staff = self.last_checked_avail_staff
-        staff_this_round = None
-        staff_check_interval = 1.0 if (self.in_staff_shortage_mode or self.stand_skip_index > 0) else 1.5
+        staff_check_interval = 0.6 if (self.in_staff_shortage_mode or self.stand_skip_index > 0) else 1.2
         if now - self.last_staff_check_time > staff_check_interval:
-            staff_this_round = self.check_global_staff(screen_image=current_screen)
-            self._update_staff_tracker(staff_this_round)
-            self.last_staff_check_time = now
+            fast_staff_ok = (self._locate_on_screen('green_dot.png', screen,
+                              region=self.REGION_GREEN_DOT) is not None)
+            if fast_staff_ok and not self.in_staff_shortage_mode and self.stand_skip_index == 0:
+                self.last_staff_check_time = now
+            else:
+                staff_val = self.check_global_staff(screen_image=screen)
+                self._update_staff_tracker(staff_val)
+                self.last_staff_check_time = now
+                # 短缺恢复检测：地勤恢复到充足水平自动退出短缺模式
+                if self.in_staff_shortage_mode or self.stand_skip_index > 0:
+                    prev = self.last_checked_avail_staff
+                    if staff_val is not None:
+                        should_recover = False
+                        if prev != -1 and staff_val != prev:
+                            self.log(f"✅ [实时] 地勤变化 ({prev}→{staff_val})，恢复执行")
+                            should_recover = True
+                        elif staff_val >= 15:
+                            self.log(f"✅ [实时] 地勤充足 ({staff_val})，恢复执行")
+                            should_recover = True
+                        else:
+                            req = self._stat_last_required_cost
+                            if req is not None and staff_val >= (req + 1):
+                                self.log(f"✅ [实时] 地勤满足需求 ({staff_val}>={req+1})，恢复执行")
+                                should_recover = True
+                        if should_recover:
+                            self.in_staff_shortage_mode = False
+                            self.stand_skip_index = 0
+                            self._next_staff_recovery_probe_time = 0.0
+                        self.last_checked_avail_staff = staff_val
 
-        if self.in_staff_shortage_mode or self.stand_skip_index > 0:
-            current_avail = staff_this_round if staff_this_round is not None else self.check_global_staff(screen_image=current_screen)
-            if current_avail is not None:
-                is_blind_recovery = (prev_staff >= 900) and (current_avail < 900)
-                is_changed = (prev_staff != -1) and (current_avail != prev_staff)
-                is_zero_recovery = (prev_staff == 0) and (current_avail > 0)
-                is_safe_amount = current_avail >= 15
-                required_cost = self._stat_last_required_cost
-                meets_required_cost = required_cost is not None and current_avail >= (required_cost + 1)
-                if is_safe_amount or is_changed or is_blind_recovery or is_zero_recovery or meets_required_cost:
-                    if meets_required_cost:
-                        self.log(f"✅ 地勤已满足当前需求 ({current_avail} >= {required_cost + 1})，恢复执行")
-                    elif is_changed:
-                        self.log(f"✅ 地勤变化 ({prev_staff}->{current_avail})，恢复")
-                    self.in_staff_shortage_mode = False
-                    self.stand_skip_index = 0
-                    self._next_staff_recovery_probe_time = 0.0
-                self.last_checked_avail_staff = current_avail
+        # ── 阶段 4：超快速任务扫描 ──
+        raw_matches = self._scan_tasks_ultra_fast(screen)
+        tasks = []
+        for m in raw_matches:
+            mapped = self._map_task_to_handler(m)
+            if mapped:
+                tasks.append(mapped)
 
-        if self._check_and_perform_auto_delay(current_screen): return True
-        lx, ly, lw, lh = self.LIST_ROI_X, 0, self.LIST_ROI_W, self.LIST_ROI_H
-        list_roi_img = current_screen[ly:ly + lh, lx:lx + lw]
-        _, final_tasks = self._run_pending_detection(list_roi_img)
-        # 注意：运行过程中不再与 ADB 校验后自动回退，仅在启动时通过截图方案测试和回退链确定方案
-
-        doing_tasks = [d for d in final_tasks if d['type'] == 'doing']
-        if not self.enable_no_takeoff_mode:
-            for det in doing_tasks:
-                if time.time() <= self.doing_task_forbidden_until:
-                    continue
-                if self._is_task_on_cooldown(det):
-                    continue
-                self.log(f"⚡ [高优] 发现 Doing 任务 (分数: {det['score']:.2f})")
-                if self._execute_task(det):
-                    return True
-
-        valid_candidates = []
-        no_takeoff_strategy = self._get_no_takeoff_strategy() if self.enable_no_takeoff_mode else None
-        skips_left = self.stand_skip_index
-        for t in final_tasks:
-            if t['type'] == 'doing' and not self.enable_no_takeoff_mode:
-                continue
-            if t['type'] == 'stand':
-                if self.in_staff_shortage_mode:
-                    # 全局短缺模式：定期探测一次
-                    if time.time() < self._next_staff_recovery_probe_time:
-                        continue
-                    self.log("📋 [调度] 地勤短缺恢复探测：尝试执行停机位任务")
-                    self._next_staff_recovery_probe_time = time.time() + self._staff_recovery_probe_interval
-                    # 探测时不跳过，但每轮只探一个（由 shortage 模式 continue 保证后续 stand 不进候选）
-                elif skips_left > 0:
-                    # 逐架跳过：跳过前 N 架已尝试失败的，尝试后续
-                    skips_left -= 1
-                    continue
-            if self._is_task_on_cooldown(t):
-                continue
-            valid_candidates.append(t)
-
-        if not valid_candidates:
-            if self.enable_no_takeoff_mode and no_takeoff_strategy == 'landing_stand_cycle':
-                self._toggle_no_takeoff_cycle_side(reason="当前分组无任务")
-                self._periodic_15s_check(force_initial_filter_check=True)
+        if not tasks:
             if not self._no_candidate_closed:
                 self._no_candidate_closed = True
-                n_doing = len(doing_tasks)
-                n_total = len(final_tasks)
-                self.log(f"📋 [检测] 任务数={n_total}, Doing={n_doing}, 有效候选=0 -> 关闭窗口")
                 self.close_window()
             return False
 
         self._no_candidate_closed = False
-        ordered_tasks = []
-        if self.enable_random_task and len(valid_candidates) > 1:
-            top_k = 3
-            if random.random() < 0.8:
-                pool = valid_candidates[:top_k]
-                first = random.choice(pool)
-            else:
-                pool = valid_candidates[top_k:]
-                if not pool:
-                    pool = valid_candidates[:top_k]
-                first = random.choice(pool)
-            ordered_tasks = [first] + [t for t in valid_candidates if t is not first]
-        else:
-            ordered_tasks = valid_candidates
 
-        time_until_refresh = self.next_list_refresh_time - time.time()
-        if 0 < time_until_refresh < 0.8:
-            self.sleep(time_until_refresh + 0.5)
+        # 分离 Doing 任务（高优先级）
+        doing_tasks = [t for t in tasks if t['type'] == 'doing']
+        other_tasks = [t for t in tasks if t['type'] != 'doing']
+
+        # Doing 任务优先秒处理
+        if not self.enable_no_takeoff_mode:
+            for dt in doing_tasks:
+                if time.time() <= self.doing_task_forbidden_until:
+                    continue
+                if self._is_task_on_cooldown(dt):
+                    continue
+                self.log(f"⚡ [秒处理] Doing 任务 (分数:{dt['score']:.2f})")
+                if self._execute_task(dt):
+                    return True
+
+        # 构建有效候选
+        valid = []
+        skips = self.stand_skip_index
+        for t in other_tasks:
+            if self.enable_no_takeoff_mode:
+                # 不起飞模式下所有非 Doing 任务都有效
+                if t['type'] == 'stand':
+                    if self.in_staff_shortage_mode:
+                        if time.time() < self._next_staff_recovery_probe_time:
+                            continue
+                        self._next_staff_recovery_probe_time = time.time() + self._staff_recovery_probe_interval
+                    elif skips > 0:
+                        skips -= 1
+                        continue
+            if self._is_task_on_cooldown(t):
+                continue
+            valid.append(t)
+
+        if not valid:
+            if not self._no_candidate_closed:
+                self._no_candidate_closed = True
+                self.close_window()
             return False
 
-        for task in ordered_tasks:
+        self._no_candidate_closed = False
+
+        # 随机排序（可选）
+        if self.enable_random_task and len(valid) > 1:
+            if random.random() < 0.8:
+                first = random.choice(valid[:min(3, len(valid))])
+            else:
+                rest = valid[min(3, len(valid)):]
+                first = random.choice(rest if rest else valid[:1])
+            ordered = [first] + [t for t in valid if t is not first]
+        else:
+            ordered = valid
+
+        # 列表刷新冷却
+        if 0 < self.next_list_refresh_time - time.time() < 0.6:
+            self.sleep(self.next_list_refresh_time - time.time() + 0.3)
+            return False
+
+        # 执行任务
+        for task in ordered:
             if self._execute_task(task):
                 return True
         return False
