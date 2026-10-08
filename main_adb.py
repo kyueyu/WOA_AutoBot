@@ -1983,7 +1983,11 @@ class WoaBot:
     def close_window(self):
         if self.adb is None:
             return
-        self.adb.double_click(self.CLOSE_X, self.CLOSE_Y, random_offset=30)
+        if self.backend == "mac_native":
+            # Mac 原生版双击地图=缩放地图（且不会关闭详情面板），改为单击
+            self.adb.click(self.CLOSE_X, self.CLOSE_Y, random_offset=30)
+        else:
+            self.adb.double_click(self.CLOSE_X, self.CLOSE_Y, random_offset=30)
         self.last_window_close_time = time.time()
         self.sleep(0.05)
 
@@ -2895,13 +2899,16 @@ class WoaBot:
                     _rwait(0.3, 0.1)
 
                 # B3：全屏等待降落按钮（循环中也检测 stand_confirm 兜底）
-                post_deadline = time.time() + (6.0 if is_fast else 10.0) + random.uniform(0, 1.5)
+                # Mac：确认后 0.4s 内即出现「落地许可」或「等待跑道净空」，后者无模板，短超时即退出、稍后重访
+                is_mac = self.backend == "mac_native"
+                post_deadline = time.time() + (2.5 if is_mac else (6.0 if is_fast else 10.0)) + random.uniform(0, 1.5)
                 while time.time() < post_deadline:
                     self._check_running()
                     s2 = self.adb.get_screenshot()
                     if s2 is None:
                         time.sleep(random.uniform(0.08, 0.12)); continue
-                    if self._locate_on_screen('main_interface.png', s2,
+                    # Mac 面板打开时左上 ☰ 仍可见，不能据此判定窗口已关闭
+                    if not is_mac and self._locate_on_screen('main_interface.png', s2,
                                               confidence=0.8, region=self.REGION_MAIN_ANCHOR):
                         self.log("   -> ℹ️ 窗口已关闭，判定为塔台接管")
                         return True
@@ -3736,8 +3743,6 @@ class WoaBot:
                 self._no_candidate_closed = True
                 self.close_window()
             return False
-
-        self._no_candidate_closed = False
 
         # 分离 Doing 任务（高优先级）
         doing_tasks = [t for t in tasks if t['type'] == 'doing']

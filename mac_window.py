@@ -93,6 +93,21 @@ def find_woa_window():
     return max(candidates, key=lambda w: w["bounds"]["w"] * w["bounds"]["h"])
 
 
+def owner_pid_at(gx, gy):
+    """返回全局点 (gx, gy) 处最上层可见窗口的进程 pid（普通窗口/置顶浮窗），无则 None。
+    只看 layer 0~19：Dock(20) 有一个覆盖全屏的透明窗口，菜单栏在 24+。"""
+    _require_mac()
+    options = (Quartz.kCGWindowListOptionOnScreenOnly
+               | Quartz.kCGWindowListExcludeDesktopElements)
+    for info in Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID) or []:
+        if not 0 <= int(info.get(Quartz.kCGWindowLayer, 0)) < 20 or info.get(Quartz.kCGWindowAlpha, 1.0) <= 0:
+            continue
+        b = _bounds_dict_to_rect(info.get(Quartz.kCGWindowBounds) or {})
+        if b["x"] <= gx < b["x"] + b["w"] and b["y"] <= gy < b["y"] + b["h"]:
+            return int(info.get(Quartz.kCGWindowOwnerPID, 0))
+    return None
+
+
 def get_window_by_id(window_id):
     """按窗口 id 重新查询（用于刷新窗口位置/尺寸），找不到返回 None。"""
     for window in list_windows(name_filter=False):

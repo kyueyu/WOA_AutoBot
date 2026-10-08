@@ -219,6 +219,20 @@ class MacNativeController(VisionMixin):
         return gx, gy
 
     # ─── 输入 ───────────────────────────────────────────
+    def _ensure_on_top(self, gx, gy):
+        # 合成点击会落在该点最上层的窗口上：与其它窗口(Claude/GUI/终端)共屏被盖住时，先激活 WOA；仍被盖住则放弃本次输入
+        pid = self._window.get("pid")
+        if mac_window.owner_pid_at(gx, gy) == pid:
+            return True
+        mac_window.activate_window(self._window)
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            time.sleep(0.05)
+            if mac_window.owner_pid_at(gx, gy) == pid:
+                return True
+        print(f">>> [Mac] WOA 窗口在 ({gx:.0f},{gy:.0f}) 被其它窗口遮挡，已跳过本次点击")
+        return False
+
     def click(self, x, y, random_offset=5):
         self._do_think()
         jitter = max(float(random_offset), float(self.default_click_jitter))
@@ -230,6 +244,8 @@ class MacNativeController(VisionMixin):
         if self._window is None:
             return
         gx, gy = self._device_to_global(dev_x, dev_y)
+        if not self._ensure_on_top(gx, gy):
+            return
         mac_input.click(gx, gy)
         self.invalidate_screenshot_cache()
 
@@ -239,6 +255,8 @@ class MacNativeController(VisionMixin):
         x, y = self._apply_coordinate_jitter(x, y, float(random_offset))
         dev_x, dev_y = self._logical_to_device_point(int(round(x)), int(round(y)))
         gx, gy = self._device_to_global(dev_x, dev_y)
+        if not self._ensure_on_top(gx, gy):
+            return
         mac_input.double_click(gx, gy)
         self.invalidate_screenshot_cache()
 
@@ -248,6 +266,8 @@ class MacNativeController(VisionMixin):
             return
         g1 = self._device_to_global(*self._logical_to_device_point(x1, y1))
         g2 = self._device_to_global(*self._logical_to_device_point(x2, y2))
+        if not (self._ensure_on_top(*g1) and self._ensure_on_top(*g2)):
+            return
         mac_input.drag(g1[0], g1[1], g2[0], g2[1], duration_ms=duration_ms)
         self.invalidate_screenshot_cache()
 
